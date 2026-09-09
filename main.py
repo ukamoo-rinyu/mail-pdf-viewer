@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QStyle,
     QStyledItemDelegate,
+    QTabBar,
     QTabWidget,
     QToolBar,
     QToolButton,
@@ -1549,6 +1550,25 @@ class RecentPdfListWidget(QListWidget):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
+    MAX_CONTENT_WIDTH = 1000  # これを超える項目数のときは幅を打ち切り、内部の横スクロールに任せる
+
+    def resize_to_content(self):
+        """項目数に合わせて実際に必要な幅ちょうどに固定する
+        (親レイアウト側のAlignHCenterと組み合わせて中央寄せするため)。
+        親レイアウトにAlignHCenterを渡すとQtはこのウィジェットを引き伸ばさず自然な
+        サイズで配置するので、幅を明示的に固定しておかないと常にsizeHint()の
+        デフォルト値(内容に関わらず固定の256px)で描画されてしまう。
+        """
+        count = self.count()
+        if count == 0:
+            return
+        self.setMinimumWidth(0)
+        self.setMaximumWidth(16777215)  # 一旦解除してから正しい位置でレイアウトさせる
+        self.doItemsLayout()
+        last_rect = self.visualItemRect(self.item(count - 1))
+        content_width = last_rect.right() + 16
+        self.setFixedWidth(min(content_width, self.MAX_CONTENT_WIDTH))
+
 
 class WelcomeWidget(QWidget):
     """PDFを1つも開いていないときに表示する開始画面。操作案内と、お気に入り/最近使った
@@ -1570,15 +1590,7 @@ class WelcomeWidget(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(40, 32, 40, 32)
         outer.setSpacing(16)
-        outer.addStretch(2)
-
-        title = QLabel("メールPDF閲覧アプリ")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        f = QFont()
-        f.setPointSize(18)
-        f.setBold(True)
-        title.setFont(f)
-        outer.addWidget(title)
+        outer.addStretch(1)
 
         guide = QLabel("PDFファイルをここにドラッグ&ドロップするか、下のボタンから開いてください。")
         guide.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1596,20 +1608,22 @@ class WelcomeWidget(QWidget):
         outer.addSpacing(12)
 
         self.favorites_label = QLabel("お気に入り")
+        self.favorites_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.favorites_label.setStyleSheet("font-weight: 600; color: #2A2D33;")
         outer.addWidget(self.favorites_label)
         self.favorites_list = RecentPdfListWidget()
         self._wire_list(self.favorites_list)
-        outer.addWidget(self.favorites_list)
+        outer.addWidget(self.favorites_list, 0, Qt.AlignmentFlag.AlignHCenter)
 
         self.recent_label = QLabel("最近使ったPDF")
+        self.recent_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.recent_label.setStyleSheet("font-weight: 600; color: #2A2D33;")
         outer.addWidget(self.recent_label)
         self.recent_list = RecentPdfListWidget()
         self._wire_list(self.recent_list)
-        outer.addWidget(self.recent_list)
+        outer.addWidget(self.recent_list, 0, Qt.AlignmentFlag.AlignHCenter)
 
-        outer.addStretch(3)
+        outer.addStretch(1)
 
     def _wire_list(self, list_widget: "RecentPdfListWidget"):
         list_widget.itemActivated.connect(self._on_item_activated)
@@ -1638,6 +1652,7 @@ class WelcomeWidget(QWidget):
             if pixmap is not None:
                 item.setIcon(QIcon(pixmap))
             list_widget.addItem(item)
+        list_widget.resize_to_content()
 
     def _thumbnail_for(self, path: str) -> "QPixmap | None":
         try:
@@ -1711,14 +1726,14 @@ class MainWindow(QMainWindow):
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tabs.currentChanged.connect(self._on_current_tab_changed)
+        self.tabs.tabBarClicked.connect(self._on_tab_bar_clicked)
 
-        # タブバー右端の「+」ボタン。押すと開始画面(お気に入り・最近使ったPDF・
-        # PDFを開くボタン)を新しいタブとして表示する。
-        new_tab_button = QToolButton()
-        new_tab_button.setText("+")
-        new_tab_button.setToolTip("開始画面を表示")
-        new_tab_button.clicked.connect(self.open_welcome_tab)
-        self.tabs.setCornerWidget(new_tab_button, Qt.Corner.TopRightCorner)
+        # タブ一覧の末尾に固定表示する「+」タブ(閉じるボタンなし)。クリックすると
+        # 開始画面(お気に入り・最近使ったPDF・PDFを開くボタン)をタブとして開く。
+        self._plus_widget = QWidget()
+        plus_index = self.tabs.addTab(self._plus_widget, "+")
+        self.tabs.tabBar().setTabButton(plus_index, QTabBar.ButtonPosition.RightSide, None)
+        self.tabs.setTabToolTip(plus_index, "開始画面を表示")
 
         self.setCentralWidget(self.tabs)
 
@@ -1916,6 +1931,15 @@ class MainWindow(QMainWindow):
                 return i
         return -1
 
+    def _plus_tab_index(self) -> int:
+        """常に末尾に固定表示している「+」タブの現在位置(通常タブ挿入時の基準位置)。"""
+        idx = self.tabs.indexOf(self._plus_widget)
+        return idx if idx >= 0 else self.tabs.count()
+
+    def _on_tab_bar_clicked(self, index: int):
+        if self.tabs.widget(index) is self._plus_widget:
+            self.open_welcome_tab()
+
     def open_welcome_tab(self):
         """開始画面(お気に入り・最近使ったPDF)を新しいタブとして開く(既にあればそこへ切り替える)。"""
         existing = self._find_welcome_tab_index()
@@ -1926,7 +1950,7 @@ class MainWindow(QMainWindow):
             return
         welcome = WelcomeWidget(self)
         welcome.refresh()
-        idx = self.tabs.addTab(welcome, welcome.title)
+        idx = self.tabs.insertTab(self._plus_tab_index(), welcome, welcome.title)
         self.tabs.setCurrentIndex(idx)
 
     def open_pdf_dialog(self):
@@ -1946,7 +1970,7 @@ class MainWindow(QMainWindow):
             mode = parser.detect_mode(path)
             tab_cls = PdfTab if mode == "mail" else DocumentPdfTab
             tab = tab_cls(path)
-            self.tabs.addTab(tab, tab.title)
+            self.tabs.insertTab(self._plus_tab_index(), tab, tab.title)
 
         ok = tab.load(force_rebuild=force_rebuild, status_cb=self.status.showMessage)
         idx = self.tabs.indexOf(tab)
@@ -1984,13 +2008,15 @@ class MainWindow(QMainWindow):
 
     def _close_tab(self, index: int):
         tab = self.tabs.widget(index)
+        if tab is self._plus_widget:
+            return  # 「+」タブは閉じるボタンが無いため通常は到達しないが、念のため保護する
         self.tabs.removeTab(index)
         if isinstance(tab, BasePdfTab):
             tab.document.close()
         if tab is not None:
             tab.deleteLater()
-        # タブが1つも無くなると画面が真っ白になってしまうため、開始画面を開いておく。
-        if self.tabs.count() == 0:
+        # 「+」タブ以外に何も残らないと画面が真っ白になってしまうため、開始画面を開いておく。
+        if self.tabs.count() <= 1:
             self.open_welcome_tab()
         self._update_controls_enabled()
 
