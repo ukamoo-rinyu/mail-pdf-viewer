@@ -34,7 +34,8 @@ CREATE TABLE mails (
     start_page INTEGER,
     end_page INTEGER,
     body_text TEXT,
-    preview TEXT
+    preview TEXT,
+    is_read INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE VIRTUAL TABLE mails_fts USING fts5(
@@ -88,7 +89,23 @@ def _pdf_signature(pdf_path: str) -> str:
     return f"{st.st_size}:{int(st.st_mtime)}"
 
 
+def _existing_read_ids(db_path: str) -> set[int]:
+    """再構築前に既読状態を退避する(同じPDFのしおり構成が変わらなければidが一致するため)。"""
+    if not os.path.exists(db_path):
+        return set()
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute("SELECT id FROM mails WHERE is_read=1").fetchall()
+        finally:
+            conn.close()
+        return {r[0] for r in rows}
+    except sqlite3.DatabaseError:
+        return set()
+
+
 def _build(pdf_path: str, db_path: str) -> None:
+    read_ids = _existing_read_ids(db_path)
     if os.path.exists(db_path):
         os.remove(db_path)
 
@@ -104,8 +121,8 @@ def _build(pdf_path: str, db_path: str) -> None:
             conn.executemany(
                 """INSERT INTO mails
                    (id, raw_title, subject, sender, sender_short, to_addr, cc, attachments, attachments_json,
-                    received_at, sent_at, title_datetime, start_page, end_page, body_text, preview)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    received_at, sent_at, title_datetime, start_page, end_page, body_text, preview, is_read)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 [
                     (
                         m.index, m.raw_title, m.subject, m.sender, m.sender_short, m.to, m.cc,
@@ -115,6 +132,7 @@ def _build(pdf_path: str, db_path: str) -> None:
                         m.received_at, m.sent_at,
                         m.sent_date_from_title.isoformat() if m.sent_date_from_title else "",
                         m.start_page, m.end_page, m.body_text, m.preview,
+                        1 if m.index in read_ids else 0,
                     )
                     for m in mails
                 ],
@@ -166,14 +184,28 @@ def open_or_build(pdf_path: str, mode: str = "mail", force_rebuild: bool = False
 
     try:
         conn = sqlite3.connect(db_path)
-        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
-        conn.close()
-        if meta.get("pdf_signature") != sig or meta.get("mode", "mail") != mode:
-            builder(pdf_path, db_path)
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+            if meta.get("pdf_signature") != sig or meta.get("mode", "mail") != mode:
+                conn.close()
+                builder(pdf_path, db_path)
+                return db_path
+            if mode == "mail":
+                _migrate_is_read_column(conn)
+        finally:
+            conn.close()
     except sqlite3.DatabaseError:
         builder(pdf_path, db_path)
 
     return db_path
+
+
+def _migrate_is_read_column(conn: sqlite3.Connection) -> None:
+    """is_read列導入前(2026-09以前)に作成されたインデックスDBへ列を追加する。"""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(mails)")}
+    if "is_read" not in columns:
+        with conn:
+            conn.execute("ALTER TABLE mails ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0")
 
 
 @dataclass
@@ -199,6 +231,7 @@ class MailRow:
     start_page: int
     end_page: int
     preview: str
+    is_read: bool = False
 
     def attachment_list(self) -> list[AttachmentInfo]:
         if not self.attachments_json:
@@ -208,14 +241,15 @@ class MailRow:
 
 
 _COLUMNS = ("id, subject, sender, sender_short, to_addr, cc, attachments, attachments_json, "
-            "received_at, sent_at, title_datetime, start_page, end_page, preview")
+            "received_at, sent_at, title_datetime, start_page, end_page, preview, is_read")
 
 # UIから選べる並び替えキー。値はDBの実カラム名(SQLインジェクション対策のためホワイトリスト管理)。
 SORT_COLUMNS = {"date": "title_datetime", "subject": "subject", "sender": "sender_short"}
 
 
 def _row_to_mail(row) -> MailRow:
-    return MailRow(*row)
+    *rest, is_read = row
+    return MailRow(*rest, is_read=bool(is_read))
 
 
 def _order_by(sort_key: str, descending: bool, prefix: str = "") -> str:
@@ -282,6 +316,33 @@ def get_body_text(db_path: str, mail_id: int) -> str:
     finally:
         conn.close()
     return row[0] if row else ""
+
+
+def set_read(db_path: str, mail_id: int, read: bool = True) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        with conn:
+            conn.execute("UPDATE mails SET is_read=? WHERE id=?", (1 if read else 0, mail_id))
+    finally:
+        conn.close()
+
+
+def mark_all_read(db_path: str, read: bool = True) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        with conn:
+            conn.execute("UPDATE mails SET is_read=?", (1 if read else 0,))
+    finally:
+        conn.close()
+
+
+def count_unread(db_path: str) -> int:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM mails WHERE is_read=0").fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else 0
 
 
 # --------------------------------------------------------- 一般資料PDF(しおり階層閲覧)

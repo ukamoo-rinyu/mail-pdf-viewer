@@ -19,6 +19,22 @@ LABELS = ["件名", "差出人", "宛先", "CC", "添付ファイル", "受信�
 
 _DATE_RE = re.compile(r"^\s*(\d{4}\s*年|[A-Za-z]{3},\s*\d{1,2}\s*[A-Za-z]{3}\s*\d{4})")
 
+# 「Re:」「Fwd:」等の返信・転送プレフィックスを除去し、同一スレッドの件名を同一視するためのキーを作る。
+SUBJECT_PREFIX_RE = re.compile(
+    r"^\s*(?:re|fw|fwd)\s*[:：]\s*|^\s*(?:返信|転送)\s*[:：]\s*",
+    re.IGNORECASE,
+)
+
+
+def normalize_subject(subject: str) -> str:
+    text = subject or ""
+    while True:
+        stripped = SUBJECT_PREFIX_RE.sub("", text, count=1)
+        if stripped == text:
+            break
+        text = stripped
+    return text.strip()
+
 
 @dataclass
 class TocNode:
@@ -347,3 +363,17 @@ def extract_document_sections(pdf_path: str) -> list[DocSection]:
         return sections
     finally:
         doc.close()
+
+
+def save_page_range(src_path: str, dest_path: str, start_page: int, end_page: int):
+    """1始まりのページ範囲[start_page, end_page]を、元PDFのままの品質で別ファイルに書き出す。"""
+    src = fitz.open(src_path)
+    try:
+        out = fitz.open()
+        try:
+            out.insert_pdf(src, from_page=start_page - 1, to_page=end_page - 1)
+            out.save(dest_path)
+        finally:
+            out.close()
+    finally:
+        src.close()

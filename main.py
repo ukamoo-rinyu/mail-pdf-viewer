@@ -9,6 +9,7 @@ KojiPDFが出力した「メール束PDF」を読み込み、メール一覧(差
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 from PySide6.QtCore import (
@@ -39,6 +40,7 @@ from PySide6.QtWidgets import (
     QListView,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QSplitter,
     QStatusBar,
     QStyle,
@@ -52,10 +54,12 @@ from PySide6.QtWidgets import (
 )
 
 import db
+import outlook_reply
 import parser
 
 MAIL_ROLE = Qt.UserRole + 1
 SECTION_ROLE = Qt.UserRole + 1
+HEADER_ROLE = Qt.UserRole + 3
 MAX_RECENT_FILES = 10
 
 MAIL_SEARCH_PLACEHOLDER = "件名・差出人・宛先・本文・添付ファイル名で検索  (Ctrl+F)"
@@ -85,24 +89,106 @@ def _format_date(title_datetime: str, fallback: str) -> str:
     return fallback
 
 
+_INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
+
+
+def _sanitize_filename(name: str, fallback: str = "PDF") -> str:
+    name = _INVALID_FILENAME_CHARS.sub("_", (name or "").strip())
+    return name or fallback
+
+
+
+class MailGroupHeader:
+    """件名グループ化モードで、同一件名(正規化後)のメールをまとめる見出し行。"""
+
+    def __init__(self, key: str, title: str):
+        self.key = key
+        self.title = title
+        self.mails: list[db.MailRow] = []
+        self.collapsed = False
+
+
 # ----------------------------------------------------------------- モデル
 class MailListModel(QAbstractListModel):
     def __init__(self):
         super().__init__()
-        self._rows: list[db.MailRow] = []
+        self._all_rows: list[db.MailRow] = []
+        self._entries: list = []  # db.MailRow または MailGroupHeader の混在リスト
+        self._grouped = False
+        self._collapsed: set[str] = set()  # 折りたたみ中のグループキー(件名グループ化トグル/再検索をまたいで保持)
 
-    def set_rows(self, rows: list[db.MailRow]):
+    def set_rows(self, rows: list[db.MailRow], grouped: bool = False):
+        self._all_rows = rows
+        self._grouped = grouped
+        self._rebuild_entries()
+
+    def toggle_collapsed(self, key: str):
+        if key in self._collapsed:
+            self._collapsed.discard(key)
+        else:
+            self._collapsed.add(key)
+        self._rebuild_entries()
+
+    def expand_group(self, key: str):
+        if key in self._collapsed:
+            self._collapsed.discard(key)
+            self._rebuild_entries()
+
+    def is_group_collapsed(self, key: str) -> bool:
+        return key in self._collapsed
+
+    def _rebuild_entries(self):
         self.beginResetModel()
-        self._rows = rows
+        entries: list = []
+        if not self._grouped:
+            entries = list(self._all_rows)
+        else:
+            groups: dict[str, MailGroupHeader] = {}
+            order: list[str] = []
+            for row in self._all_rows:
+                key = parser.normalize_subject(row.subject)
+                header = groups.get(key)
+                if header is None:
+                    header = MailGroupHeader(key, key)
+                    groups[key] = header
+                    order.append(key)
+                header.mails.append(row)
+            for key in order:
+                header = groups[key]
+                if len(header.mails) < 2:
+                    # 同じ件名が他に無ければグループ化する意味が無いのでそのまま1件表示する。
+                    entries.append(header.mails[0])
+                    continue
+                header.mails.sort(key=lambda r: r.title_datetime or "")
+                header.collapsed = key in self._collapsed
+                entries.append(header)
+                if not header.collapsed:
+                    entries.extend(header.mails)
+        self._entries = entries
         self.endResetModel()
 
     def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self._rows)
+        return 0 if parent.isValid() else len(self._entries)
+
+    def flags(self, index: QModelIndex):
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        if isinstance(self._entries[index.row()], MailGroupHeader):
+            # 見出し行は選択不可(クリックは効くが一覧のハイライト対象にはしない)にする。
+            return Qt.ItemFlag.ItemIsEnabled
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
 
     def data(self, index: QModelIndex, role=Qt.DisplayRole):
         if not index.isValid():
             return None
-        row = self._rows[index.row()]
+        entry = self._entries[index.row()]
+        if isinstance(entry, MailGroupHeader):
+            if role == Qt.DisplayRole:
+                return entry.title
+            if role == HEADER_ROLE:
+                return entry
+            return None
+        row = entry
         if role == Qt.DisplayRole:
             return row.subject
         if role == MAIL_ROLE:
@@ -115,16 +201,54 @@ class MailListModel(QAbstractListModel):
             )
         return None
 
-    def mail_at(self, row_idx: int) -> db.MailRow:
-        return self._rows[row_idx]
+    def mail_at(self, row_idx: int) -> "db.MailRow | None":
+        if not 0 <= row_idx < len(self._entries):
+            return None
+        entry = self._entries[row_idx]
+        return entry if isinstance(entry, db.MailRow) else None
+
+    def header_at(self, row_idx: int) -> "MailGroupHeader | None":
+        if not 0 <= row_idx < len(self._entries):
+            return None
+        entry = self._entries[row_idx]
+        return entry if isinstance(entry, MailGroupHeader) else None
+
+    def all_rows(self) -> list["db.MailRow"]:
+        return self._all_rows
+
+    def first_mail_index(self) -> QModelIndex:
+        for i, entry in enumerate(self._entries):
+            if isinstance(entry, db.MailRow):
+                return self.index(i, 0)
+        return QModelIndex()
+
+    def index_for_mail_id(self, mail_id: int) -> QModelIndex:
+        for i, entry in enumerate(self._entries):
+            if isinstance(entry, db.MailRow) and entry.id == mail_id:
+                return self.index(i, 0)
+        return QModelIndex()
 
     def is_empty(self) -> bool:
-        return not self._rows
+        return not self._all_rows
+
+    def set_read(self, mail_id: int, read: bool = True):
+        """既読/未読状態をメモリ上のRowにも反映し、該当行を再描画させる。"""
+        for row in self._all_rows:
+            if row.id == mail_id:
+                row.is_read = read
+                break
+        idx = self.index_for_mail_id(mail_id)
+        if idx.isValid():
+            self.dataChanged.emit(idx, idx, [MAIL_ROLE])
+
+    def unread_count(self) -> int:
+        return sum(1 for row in self._all_rows if not row.is_read)
 
 
 # --------------------------------------------------------------- デリゲート
 class MailItemDelegate(QStyledItemDelegate):
     ROW_HEIGHT = 104
+    HEADER_HEIGHT = 34
     AVATAR_SIZE = 40
     CHIP_FONT_SIZE = 8
     CHIP_HEIGHT = 22
@@ -138,6 +262,8 @@ class MailItemDelegate(QStyledItemDelegate):
         self.hover_chip: tuple[int, int] | None = None  # (row, chip_index)
 
     def sizeHint(self, option, index):
+        if index.data(HEADER_ROLE) is not None:
+            return QSize(option.rect.width(), self.HEADER_HEIGHT)
         return QSize(option.rect.width(), self.ROW_HEIGHT)
 
     def _text_geometry(self, rect: QRect) -> tuple[int, int, int]:
@@ -183,6 +309,11 @@ class MailItemDelegate(QStyledItemDelegate):
         return chips, font
 
     def paint(self, painter, option, index):
+        header: MailGroupHeader | None = index.data(HEADER_ROLE)
+        if header is not None:
+            self._paint_header(painter, option, header)
+            return
+
         mail: db.MailRow | None = index.data(MAIL_ROLE)
         if mail is None:
             return super().paint(painter, option, index)
@@ -204,6 +335,11 @@ class MailItemDelegate(QStyledItemDelegate):
         painter.setPen(QColor("#E9EBEF"))
         painter.drawLine(rect.left() + 20, rect.bottom(), rect.right() - 20, rect.bottom())
 
+        if not mail.is_read:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor("#2F6FE4")))
+            painter.drawEllipse(QRect(rect.left() + 6, rect.top() + rect.height() // 2 - 4, 8, 8))
+
         avatar_rect = QRect(rect.left() + 18, rect.top() + (rect.height() - self.AVATAR_SIZE) // 2,
                              self.AVATAR_SIZE, self.AVATAR_SIZE)
         painter.setBrush(QBrush(_avatar_color(mail.sender_short)))
@@ -223,9 +359,9 @@ class MailItemDelegate(QStyledItemDelegate):
         date_w = fm_date.horizontalAdvance(date_text)
 
         y, y2, y3, y4 = self._row_positions(rect)
-        f1 = QFont(); f1.setBold(True); f1.setPointSize(10)
+        f1 = QFont(); f1.setBold(not mail.is_read); f1.setPointSize(10)
         painter.setFont(f1)
-        painter.setPen(QColor("#16181D"))
+        painter.setPen(QColor("#16181D") if not mail.is_read else QColor("#4A4F58"))
         sender_rect = QRect(text_left, y, max(10, text_width - date_w - 12), 20)
         painter.drawText(sender_rect, Qt.AlignmentFlag.AlignVCenter,
                           QFontMetrics(f1).elidedText(mail.sender_short or "(差出人不明)",
@@ -235,9 +371,9 @@ class MailItemDelegate(QStyledItemDelegate):
         date_rect = QRect(text_right - date_w, y, date_w, 20)
         painter.drawText(date_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, date_text)
 
-        f2 = QFont(); f2.setPointSize(10)
+        f2 = QFont(); f2.setPointSize(10); f2.setBold(not mail.is_read)
         painter.setFont(f2)
-        painter.setPen(QColor("#2A2D33"))
+        painter.setPen(QColor("#2A2D33") if not mail.is_read else QColor("#6B7078"))
         subj_rect = QRect(text_left, y2, text_width, 19)
         subj = mail.subject or "(件名なし)"
         painter.drawText(subj_rect, Qt.AlignmentFlag.AlignVCenter,
@@ -290,6 +426,33 @@ class MailItemDelegate(QStyledItemDelegate):
             painter.drawText(preview_rect, Qt.AlignmentFlag.AlignVCenter,
                               QFontMetrics(f4).elidedText(preview, Qt.TextElideMode.ElideRight, text_width))
 
+        painter.restore()
+
+    def _paint_header(self, painter, option, header: "MailGroupHeader"):
+        painter.save()
+        painter.setRenderHint(painter.RenderHint.Antialiasing)
+        rect = option.rect
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+
+        painter.fillRect(rect, QColor("#E7EBF1") if hovered else QColor("#EFF2F6"))
+        painter.setPen(QColor("#D8DBE0"))
+        painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+
+        arrow = "▼" if not header.collapsed else "▶"
+        f_arrow = QFont(); f_arrow.setPointSize(9)
+        painter.setFont(f_arrow)
+        painter.setPen(QColor("#6B7078"))
+        arrow_rect = QRect(rect.left() + 16, rect.top(), 18, rect.height())
+        painter.drawText(arrow_rect, Qt.AlignmentFlag.AlignVCenter, arrow)
+
+        f_title = QFont(); f_title.setBold(True); f_title.setPointSize(9)
+        painter.setFont(f_title)
+        painter.setPen(QColor("#2A2D33"))
+        title_text = f"{header.title or '(件名なし)'}  ({len(header.mails)}件)"
+        title_rect = QRect(rect.left() + 38, rect.top(), rect.width() - 54, rect.height())
+        painter.drawText(title_rect, Qt.AlignmentFlag.AlignVCenter,
+                          QFontMetrics(f_title).elidedText(title_text, Qt.TextElideMode.ElideRight,
+                                                            title_rect.width()))
         painter.restore()
 
     def editorEvent(self, event, model, option, index):
@@ -509,12 +672,37 @@ class BasePdfTab(QWidget):
 
         self.pdf_view.pageNavigator().currentPageChanged.connect(self._on_page_changed)
 
+        self.pdf_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.pdf_view.customContextMenuRequested.connect(self._show_pdf_context_menu)
+
     @property
     def title(self) -> str:
         return os.path.basename(self.pdf_path)
 
     def set_zoom_mode(self, mode):
         self.pdf_view.setZoomMode(mode)
+
+    def set_sidebar_visible(self, visible: bool):
+        self.sidebar.setVisible(visible)
+
+    def _show_pdf_context_menu(self, pos):
+        """PDF表示部分の右クリックメニュー。全画面表示中はしおり呼び出し・全画面解除の導線が
+        ツールバーから消えてしまうため、ここから操作できるようにする。"""
+        window = self.window()
+        if not isinstance(window, QMainWindow) or not hasattr(window, "fullscreen_action"):
+            return
+        menu = QMenu(self)
+        if window.isFullScreen():
+            sidebar_visible = self.sidebar.isVisible()
+            toggle_action = menu.addAction("しおり・メール一覧を隠す" if sidebar_visible else "しおり・メール一覧を表示")
+            toggle_action.triggered.connect(window._toggle_fullscreen_sidebar)
+            menu.addSeparator()
+            exit_action = menu.addAction("全画面表示を終了")
+            exit_action.triggered.connect(lambda: window.fullscreen_action.setChecked(False))
+        else:
+            enter_action = menu.addAction("全画面表示にする")
+            enter_action.triggered.connect(lambda: window.fullscreen_action.setChecked(True))
+        menu.exec(self.pdf_view.mapToGlobal(pos))
 
     def set_search(self, query: str):
         self.current_query = query
@@ -527,6 +715,9 @@ class BasePdfTab(QWidget):
 
     def result_count(self) -> int:
         raise NotImplementedError
+
+    def unread_count(self) -> int:
+        return 0
 
     def load(self, force_rebuild: bool = False, status_cb=None) -> bool:
         raise NotImplementedError
@@ -571,6 +762,26 @@ class BasePdfTab(QWidget):
         finally:
             painter.end()
 
+    # --------------------------------------------------------------- 保存
+    def save_page_range(self, start_page: int, end_page: int, suggested_name: str):
+        """1始まりのページ範囲[start_page, end_page]を、元PDFの品質のまま別ファイルとして保存する。"""
+        suggested_name = _sanitize_filename(suggested_name)
+        if not suggested_name.lower().endswith(".pdf"):
+            suggested_name += ".pdf"
+        default_dir = os.path.dirname(self.pdf_path)
+        dest_path, _ = QFileDialog.getSaveFileName(
+            self, "PDFとして保存", os.path.join(default_dir, suggested_name), "PDF Files (*.pdf)")
+        if not dest_path:
+            return
+        try:
+            parser.save_page_range(self.pdf_path, dest_path, start_page, end_page)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "保存に失敗しました", f"PDFの保存に失敗しました。\n\n詳細: {e}")
+            return
+        window = self.window()
+        if isinstance(window, QMainWindow) and window.statusBar():
+            window.statusBar().showMessage(f"保存しました: {dest_path}", 5000)
+
     # --------------------------------------------------------- ページ移動
     def page_count(self) -> int:
         return self.document.pageCount()
@@ -606,6 +817,7 @@ class PdfTab(BasePdfTab):
         super().__init__(pdf_path, parent)
         self.sort_key = "date"
         self.sort_descending = True
+        self.group_by_subject = False
 
         self._build_ui()
 
@@ -639,6 +851,15 @@ class PdfTab(BasePdfTab):
         self.sort_dir_button.setChecked(True)
         self.sort_dir_button.toggled.connect(self._on_sort_dir_toggled)
         sort_layout.addWidget(self.sort_dir_button)
+
+        sort_layout.addSpacing(12)
+        self.group_button = QToolButton()
+        self.group_button.setCheckable(True)
+        self.group_button.setText("件名でグループ化")
+        self.group_button.setToolTip("同じ件名(返信・転送を除く)のメールをまとめて表示します")
+        self.group_button.toggled.connect(self._on_group_toggled)
+        sort_layout.addWidget(self.group_button)
+
         sort_layout.addStretch(1)
         self._update_sort_dir_label()
         left_layout.addWidget(sort_bar)
@@ -659,6 +880,7 @@ class PdfTab(BasePdfTab):
         self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self._show_context_menu)
         left_layout.addWidget(self.list_view)
+        self.sidebar = left
         splitter.addWidget(left)
 
         splitter.addWidget(self.pdf_view)
@@ -689,14 +911,18 @@ class PdfTab(BasePdfTab):
             db.search(self.db_path, self.current_query, self.sort_key, self.sort_descending)
             if self.db_path else []
         )
-        self.model.set_rows(rows)
-        if rows:
-            self.list_view.setCurrentIndex(self.model.index(0, 0))
+        self.model.set_rows(rows, grouped=self.group_by_subject)
+        first = self.model.first_mail_index()
+        if first.isValid():
+            self.list_view.setCurrentIndex(first)
         else:
             self.pdf_view.pageNavigator().jump(0, QPointF(0, 0))
 
     def result_count(self) -> int:
         return self.model.rowCount()
+
+    def unread_count(self) -> int:
+        return self.model.unread_count()
 
     def _update_sort_dir_label(self):
         desc_label, asc_label = SORT_DIR_LABELS.get(self.sort_key, SORT_DIR_LABELS["date"])
@@ -712,61 +938,158 @@ class PdfTab(BasePdfTab):
         self._update_sort_dir_label()
         self.refresh_list()
 
+    def _on_group_toggled(self, checked: bool):
+        self.group_by_subject = checked
+        self.list_view.setUniformItemSizes(not checked)
+        self.refresh_list()
+
+    def _toggle_group(self, key: str):
+        """見出し行クリック時の折りたたみ/展開。選択中メールがまだ表示されていれば選択を維持する。"""
+        current = self.list_view.currentIndex()
+        current_mail = self.model.mail_at(current.row()) if current.isValid() else None
+
+        self.model.toggle_collapsed(key)
+
+        if current_mail is not None:
+            idx = self.model.index_for_mail_id(current_mail.id)
+            if idx.isValid():
+                self._syncing_selection = True
+                try:
+                    self.list_view.setCurrentIndex(idx)
+                finally:
+                    self._syncing_selection = False
+
     def _on_index_activated(self, index: QModelIndex, *_args):
         if not index.isValid() or self.model.is_empty():
+            return
+        header = self.model.header_at(index.row())
+        if header is not None:
+            self._toggle_group(header.key)
             return
         if self._syncing_selection:
             # PDFのスクロールに追従して一覧側の選択を更新しているだけなので、
             # ここでページジャンプを行うとスクロール位置が巻き戻ってしまう。
             return
         mail = self.model.mail_at(index.row())
+        if mail is None:
+            return
+        self._mark_read(mail)
         self.pdf_view.pageNavigator().jump(mail.start_page - 1, QPointF(0, 0))
 
     def _on_attachment_clicked(self, index: QModelIndex, start_page: int):
         self.list_view.setCurrentIndex(index)
+        mail = self.model.mail_at(index.row())
+        if mail is not None:
+            self._mark_read(mail)
         # QListViewの通常クリック処理(clicked -> _on_index_activatedでメール先頭ページへジャンプ)が
         # editorEventの後に実行され、このジャンプを上書きしてしまうため、
         # 次のイベントループへ遅延させて確実に最後に反映されるようにする。
         QTimer.singleShot(0, lambda: self.pdf_view.pageNavigator().jump(start_page - 1, QPointF(0, 0)))
 
+    def _mark_read(self, mail: "db.MailRow", read: bool = True):
+        if mail.is_read == read:
+            return
+        db.set_read(self.db_path, mail.id, read)
+        self.model.set_read(mail.id, read)
+
     # --------------------------------------------------------------- 印刷
     def _show_context_menu(self, pos):
         index = self.list_view.indexAt(pos)
         if not index.isValid():
+            menu = QMenu(self)
+            action = menu.addAction("すべて既読にする")
+            action.triggered.connect(self._mark_all_read)
+            menu.exec(self.list_view.viewport().mapToGlobal(pos))
+            return
+        mail = self.model.mail_at(index.row())
+        if mail is None:
             return
         self.list_view.setCurrentIndex(index)
-        mail = self.model.mail_at(index.row())
 
         menu = QMenu(self)
+        read_action = menu.addAction("未読にする" if mail.is_read else "既読にする")
+        read_action.triggered.connect(lambda: self._mark_read(mail, not mail.is_read))
+        menu.addSeparator()
+
+        reply_action = menu.addAction("\U0001F4E7 Outlookで返信を作成...")
+        reply_action.triggered.connect(lambda: self._create_outlook_reply(mail, reply_all=False))
+        reply_all_action = menu.addAction("\U0001F4E7 Outlookで全員に返信を作成...")
+        reply_all_action.triggered.connect(lambda: self._create_outlook_reply(mail, reply_all=True))
+        menu.addSeparator()
+
         page_range = f"{mail.start_page}" if mail.start_page == mail.end_page else f"{mail.start_page}-{mail.end_page}"
+        mail_name = f"{mail.subject or '(件名なし)'}"
         mail_action = menu.addAction(f"\U0001F5A8 このメールを印刷... ({page_range}ページ)")
         mail_action.triggered.connect(lambda: self.print_page_range(mail.start_page, mail.end_page))
+        save_action = menu.addAction(f"\U0001F4BE このメールをPDFで保存... ({page_range}ページ)")
+        save_action.triggered.connect(
+            lambda: self.save_page_range(mail.start_page, mail.end_page, mail_name))
 
         attachments = [a for a in mail.attachment_list() if a.start_page is not None]
         if attachments:
             menu.addSeparator()
-            attach_menu = menu.addMenu("\U0001F4CE 添付書類を印刷...")
+            attach_print_menu = menu.addMenu("\U0001F4CE 添付書類を印刷...")
+            attach_save_menu = menu.addMenu("\U0001F4BE 添付書類をPDFで保存...")
             for att in attachments:
                 end = att.end_page or att.start_page
                 label = att.name if att.start_page == end else f"{att.name} ({att.start_page}-{end}ページ)"
-                action = attach_menu.addAction(label)
-                action.triggered.connect(
+                print_action = attach_print_menu.addAction(label)
+                print_action.triggered.connect(
                     lambda checked=False, s=att.start_page, e=end: self.print_page_range(s, e))
+                save_action = attach_save_menu.addAction(label)
+                save_action.triggered.connect(
+                    lambda checked=False, s=att.start_page, e=end, n=att.name: self.save_page_range(s, e, n))
 
         menu.exec(self.list_view.viewport().mapToGlobal(pos))
 
+    def _create_outlook_reply(self, mail: "db.MailRow", reply_all: bool = False):
+        body_text = db.get_body_text(self.db_path, mail.id) if self.db_path else ""
+        try:
+            outlook_reply.create_reply_draft(mail, body_text, reply_all=reply_all)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(
+                self, "返信の作成に失敗しました",
+                "Outlookでの下書き作成に失敗しました。Outlookが起動しているか、"
+                f"pywin32がインストールされているか確認してください。\n\n詳細: {e}")
+
+    def _mark_all_read(self):
+        if not self.db_path:
+            return
+        db.mark_all_read(self.db_path, True)
+        for row in self.model.all_rows():
+            row.is_read = True
+        count = self.model.rowCount()
+        if count:
+            self.model.dataChanged.emit(self.model.index(0, 0), self.model.index(count - 1, 0), [MAIL_ROLE])
+
     def _find_row_for_page(self, page: int) -> int | None:
-        """0始まりのページ番号を含むメールを一覧から探す(現在の並び替え/絞り込み後の順序に対して線形探索)。"""
+        """0始まりのページ番号を含むメールを一覧から探す(現在の並び替え/絞り込み後の順序に対して線形探索)。
+
+        件名グループ化中で該当メールが折りたたみで隠れている場合は、そのグループを展開してから探す。
+        """
         page_1indexed = page + 1
-        for i, mail in enumerate(self.model._rows):
-            if mail.start_page <= page_1indexed <= mail.end_page:
-                return i
-        return None
+        mail = next((m for m in self.model.all_rows()
+                     if m.start_page <= page_1indexed <= m.end_page), None)
+        if mail is None:
+            return None
+
+        if self.group_by_subject:
+            key = parser.normalize_subject(mail.subject)
+            if self.model.is_group_collapsed(key):
+                self.model.expand_group(key)
+
+        idx = self.model.index_for_mail_id(mail.id)
+        return idx.row() if idx.isValid() else None
 
     def _sync_selection_to_page(self, page: int):
         row = self._find_row_for_page(page)
         if row is None:
             return
+
+        mail = self.model.mail_at(row)
+        if mail is not None:
+            self._mark_read(mail)
+
         if self.list_view.currentIndex().row() == row:
             return
 
@@ -837,6 +1160,7 @@ class DocumentPdfTab(BasePdfTab):
         self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self._show_context_menu)
         left_layout.addWidget(self.list_view)
+        self.sidebar = left
         splitter.addWidget(left)
 
         splitter.addWidget(self.pdf_view)
@@ -907,8 +1231,11 @@ class DocumentPdfTab(BasePdfTab):
         menu = QMenu(self)
         page_range = (f"{section.start_page}" if section.start_page == section.end_page
                       else f"{section.start_page}-{section.end_page}")
-        action = menu.addAction(f"\U0001F5A8 この区間を印刷... ({page_range}ページ)")
-        action.triggered.connect(lambda: self.print_page_range(section.start_page, section.end_page))
+        print_action = menu.addAction(f"\U0001F5A8 この区間を印刷... ({page_range}ページ)")
+        print_action.triggered.connect(lambda: self.print_page_range(section.start_page, section.end_page))
+        save_action = menu.addAction(f"\U0001F4BE この区間をPDFで保存... ({page_range}ページ)")
+        save_action.triggered.connect(
+            lambda: self.save_page_range(section.start_page, section.end_page, section.title))
         menu.exec(self.list_view.viewport().mapToGlobal(pos))
 
     def _find_index_for_page(self, page: int, parent: QModelIndex = QModelIndex()) -> QModelIndex | None:
@@ -954,6 +1281,7 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("ukawa", "MailPDFViewer")
         self.setAcceptDrops(True)
         self._page_synced_tab: BasePdfTab | None = None
+        self._sidebar_visible_in_fullscreen = False
 
         self._build_ui()
         self._update_controls_enabled()
@@ -974,7 +1302,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.tabs)
 
     def _build_toolbar(self):
-        toolbar = QToolBar()
+        toolbar = self.toolbar = QToolBar()
         toolbar.setMovable(False)
         toolbar.setIconSize(QSize(20, 20))
         self.addToolBar(toolbar)
@@ -1038,11 +1366,28 @@ class MainWindow(QMainWindow):
         self.next_page_button.clicked.connect(self.go_next_page)
         toolbar.addWidget(self.next_page_button)
 
+        toolbar.addSeparator()
+        self.fullscreen_action = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_TitleBarMaxButton), "全画面表示", self)
+        self.fullscreen_action.setCheckable(True)
+        self.fullscreen_action.setToolTip(
+            "全画面表示を切り替え (F11)\n全画面中はCtrl+Bでメール一覧・しおりの表示/非表示を切り替え")
+        self.fullscreen_action.toggled.connect(self._on_fullscreen_toggled)
+        toolbar.addAction(self.fullscreen_action)
+
         find_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
         find_shortcut.activated.connect(lambda: (self.search_box.setFocus(), self.search_box.selectAll()))
 
         escape_shortcut = QShortcut(QKeySequence("Esc"), self.search_box)
         escape_shortcut.activated.connect(self.search_box.clear)
+
+        sidebar_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
+        sidebar_shortcut.activated.connect(self._toggle_fullscreen_sidebar)
+
+        # 全画面表示中はツールバー(fullscreen_actionの置き場所)ごと非表示になり、
+        # QActionにぶら下げたショートカットだけでは復帰できなくなるため、ウィンドウ直付けのQShortcutにする。
+        fullscreen_shortcut = QShortcut(QKeySequence("F11"), self)
+        fullscreen_shortcut.activated.connect(self.fullscreen_action.toggle)
 
     # --------------------------------------------------------- ドラッグ&ドロップ
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -1115,7 +1460,8 @@ class MainWindow(QMainWindow):
         if ok:
             self._add_recent_file(path)
             unit = "件のメール" if isinstance(tab, PdfTab) else "件のしおり"
-            self.status.showMessage(f"{tab.result_count()} {unit}を読み込みました", 5000)
+            self.status.showMessage(
+                f"{tab.result_count()} {unit}を読み込みました{self._unread_suffix(tab)}", 5000)
         self._update_controls_enabled()
         self._update_page_bar()
 
@@ -1130,6 +1476,10 @@ class MainWindow(QMainWindow):
     def _current_tab(self) -> BasePdfTab | None:
         return self.tabs.currentWidget()
 
+    def _unread_suffix(self, tab: BasePdfTab) -> str:
+        count = tab.unread_count()
+        return f" (未読 {count})" if count else ""
+
     def _on_current_tab_changed(self, _index: int):
         if self._page_synced_tab is not None:
             try:
@@ -1143,6 +1493,8 @@ class MainWindow(QMainWindow):
             self._update_controls_enabled()
             self._update_page_bar()
             return
+
+        self._apply_fullscreen_chrome()
 
         self.search_box.blockSignals(True)
         self.search_box.setText(tab.current_query)
@@ -1159,7 +1511,7 @@ class MainWindow(QMainWindow):
         tab.page_changed.connect(self._update_page_bar)
         self._page_synced_tab = tab
 
-        self.status.showMessage(f"{tab.result_count()} 件表示中")
+        self.status.showMessage(f"{tab.result_count()} 件表示中{self._unread_suffix(tab)}")
         self._update_controls_enabled()
         self._update_page_bar()
 
@@ -1192,7 +1544,7 @@ class MainWindow(QMainWindow):
         tab = self._current_tab()
         if tab is not None:
             tab.set_search(text)
-            self.status.showMessage(f"{tab.result_count()} 件表示中")
+            self.status.showMessage(f"{tab.result_count()} 件表示中{self._unread_suffix(tab)}")
 
     def on_zoom_mode_changed(self):
         tab = self._current_tab()
@@ -1208,6 +1560,41 @@ class MainWindow(QMainWindow):
         tab = self._current_tab()
         if tab is not None:
             tab.go_next_page()
+
+    # --------------------------------------------------------------- 全画面表示
+    def _on_fullscreen_toggled(self, checked: bool):
+        if checked:
+            self._sidebar_visible_in_fullscreen = False
+            self.showFullScreen()
+        else:
+            self.showNormal()
+        self._apply_fullscreen_chrome()
+
+    def _toggle_fullscreen_sidebar(self):
+        """全画面表示中にCtrl+Bでメール一覧・しおりの表示/非表示を切り替える。"""
+        if not self.isFullScreen():
+            return
+        self._sidebar_visible_in_fullscreen = not self._sidebar_visible_in_fullscreen
+        self._apply_fullscreen_chrome()
+
+    def _apply_fullscreen_chrome(self):
+        """全画面時はツールバー・ステータスバー・サイドバーを畳んで、PDF表示をスライドショーのように最大化する。"""
+        full = self.isFullScreen()
+        self.toolbar.setVisible(not full)
+        self.status.setVisible(not full)
+        tab = self._current_tab()
+        if tab is not None:
+            tab.set_sidebar_visible(True if not full else self._sidebar_visible_in_fullscreen)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            is_full = bool(self.windowState() & Qt.WindowState.WindowFullScreen)
+            if self.fullscreen_action.isChecked() != is_full:
+                self.fullscreen_action.blockSignals(True)
+                self.fullscreen_action.setChecked(is_full)
+                self.fullscreen_action.blockSignals(False)
+            self._apply_fullscreen_chrome()
 
 
 APP_STYLESHEET = """
