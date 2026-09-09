@@ -82,6 +82,26 @@ SORT_DIR_LABELS = {
     "sender": ("Z→A ↓", "A→Z ↑"),
 }
 
+# Windows 98風の配色(カード・チップの自前描画で使う。ツールバー等はQSS側で揃える)
+WIN98_FACE = QColor("#C0C0C0")
+WIN98_WHITE = QColor("#FFFFFF")
+WIN98_BLACK = QColor("#000000")
+WIN98_SHADOW = QColor("#808080")
+WIN98_HOVER = QColor("#DFDFDF")
+WIN98_SELECT_BG = QColor("#000080")
+WIN98_SELECT_FG = QColor("#FFFFFF")
+
+
+def _draw_win98_bevel(painter: QPainter, rect: QRect, pressed: bool = False):
+    """四角いボタン風の1px立体縁取りを描く(pressed=Trueで押し込み表現)。"""
+    light, dark = (WIN98_SHADOW, WIN98_WHITE) if pressed else (WIN98_WHITE, WIN98_SHADOW)
+    painter.setPen(QPen(light, 1))
+    painter.drawLine(rect.topLeft(), rect.topRight())
+    painter.drawLine(rect.topLeft(), rect.bottomLeft())
+    painter.setPen(QPen(dark, 1))
+    painter.drawLine(rect.bottomLeft(), rect.bottomRight())
+    painter.drawLine(rect.topRight(), rect.bottomRight())
+
 
 def _avatar_color(name: str) -> QColor:
     if not name:
@@ -325,33 +345,34 @@ class MailItemDelegate(QStyledItemDelegate):
             return super().paint(painter, option, index)
 
         painter.save()
-        painter.setRenderHint(painter.RenderHint.Antialiasing)
         rect = option.rect
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
 
         if selected:
-            painter.fillRect(rect, QColor("#E4EDFC"))
-            painter.fillRect(QRect(rect.left(), rect.top(), 3, rect.height()), QColor("#2F6FE4"))
+            painter.fillRect(rect, WIN98_SELECT_BG)
         elif hovered:
-            painter.fillRect(rect, QColor("#F5F7FA"))
+            painter.fillRect(rect, WIN98_HOVER)
         else:
-            painter.fillRect(rect, QColor("#FFFFFF"))
+            painter.fillRect(rect, WIN98_WHITE)
 
-        painter.setPen(QColor("#E9EBEF"))
-        painter.drawLine(rect.left() + 20, rect.bottom(), rect.right() - 20, rect.bottom())
+        painter.setPen(WIN98_SHADOW)
+        painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+
+        text_color = WIN98_SELECT_FG if selected else WIN98_BLACK
+        muted_color = WIN98_SELECT_FG if selected else WIN98_SHADOW
 
         if not mail.is_read:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor("#2F6FE4")))
-            painter.drawEllipse(QRect(rect.left() + 6, rect.top() + rect.height() // 2 - 4, 8, 8))
+            painter.setBrush(QBrush(text_color))
+            painter.drawRect(QRect(rect.left() + 6, rect.top() + rect.height() // 2 - 4, 8, 8))
 
         avatar_rect = QRect(rect.left() + 18, rect.top() + (rect.height() - self.AVATAR_SIZE) // 2,
                              self.AVATAR_SIZE, self.AVATAR_SIZE)
         painter.setBrush(QBrush(_avatar_color(mail.sender_short)))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(avatar_rect)
-        painter.setPen(QColor("#FFFFFF"))
+        painter.setPen(QPen(WIN98_BLACK, 1))
+        painter.drawRect(avatar_rect)
+        painter.setPen(WIN98_WHITE)
         f = QFont(); f.setBold(True); f.setPointSize(13)
         painter.setFont(f)
         initial = (mail.sender_short or "?")[0].upper()
@@ -365,21 +386,21 @@ class MailItemDelegate(QStyledItemDelegate):
         date_w = fm_date.horizontalAdvance(date_text)
 
         y, y2, y3, y4 = self._row_positions(rect)
-        f1 = QFont(); f1.setBold(not mail.is_read); f1.setPointSize(10)
+        f1 = QFont(); f1.setBold(True); f1.setPointSize(10)
         painter.setFont(f1)
-        painter.setPen(QColor("#16181D") if not mail.is_read else QColor("#4A4F58"))
+        painter.setPen(text_color)
         sender_rect = QRect(text_left, y, max(10, text_width - date_w - 12), 20)
         painter.drawText(sender_rect, Qt.AlignmentFlag.AlignVCenter,
                           QFontMetrics(f1).elidedText(mail.sender_short or "(差出人不明)",
                                                        Qt.TextElideMode.ElideRight, sender_rect.width()))
         painter.setFont(f_date)
-        painter.setPen(QColor("#4A4F58"))
+        painter.setPen(muted_color)
         date_rect = QRect(text_right - date_w, y, date_w, 20)
         painter.drawText(date_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, date_text)
 
         f2 = QFont(); f2.setPointSize(10); f2.setBold(not mail.is_read)
         painter.setFont(f2)
-        painter.setPen(QColor("#2A2D33") if not mail.is_read else QColor("#6B7078"))
+        painter.setPen(text_color)
         subj_rect = QRect(text_left, y2, text_width, 19)
         subj = mail.subject or "(件名なし)"
         painter.drawText(subj_rect, Qt.AlignmentFlag.AlignVCenter,
@@ -387,7 +408,7 @@ class MailItemDelegate(QStyledItemDelegate):
 
         f3 = QFont(); f3.setPointSize(8)
         painter.setFont(f3)
-        painter.setPen(QColor("#6B7078"))
+        painter.setPen(muted_color)
         to_text = f"宛先: {mail.to_addr}" if mail.to_addr else "宛先: (不明)"
         to_rect = QRect(text_left, y3, text_width, 16)
         painter.drawText(to_rect, Qt.AlignmentFlag.AlignVCenter,
@@ -400,25 +421,15 @@ class MailItemDelegate(QStyledItemDelegate):
             for i, chip in enumerate(chips):
                 clickable = chip["clickable"]
                 is_hovered = clickable and self.hover_chip == (index.row(), i)
-
                 draw_rect = chip["rect"]
-                if is_hovered:
-                    # マウスが乗っているチップだけ影を敷いて2px浮き上がらせ、押せることを示す
-                    shadow_rect = chip["rect"].adjusted(0, 1, 0, 3)
-                    painter.setPen(Qt.PenStyle.NoPen)
-                    painter.setBrush(QColor(0, 0, 0, 45))
-                    painter.drawRoundedRect(shadow_rect, 6, 6)
-                    draw_rect = chip["rect"].adjusted(0, -2, 0, -2)
 
-                bg = QColor("#CFE0FA") if is_hovered else (QColor("#E7EEFB") if clickable else QColor("#F0F1F3"))
-                fg = QColor("#12386B") if is_hovered else (QColor("#2F6FE4") if clickable else QColor("#9AA0A8"))
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(bg))
-                painter.drawRoundedRect(draw_rect, 6, 6)
-                if is_hovered:
-                    painter.setPen(QPen(QColor("#2F6FE4"), 1.2))
-                    painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawRoundedRect(draw_rect, 6, 6)
+                if clickable:
+                    painter.fillRect(draw_rect, WIN98_FACE)
+                    _draw_win98_bevel(painter, draw_rect, pressed=is_hovered)
+                    fg = WIN98_BLACK
+                else:
+                    painter.fillRect(draw_rect, QColor("#D8D8D8"))
+                    fg = WIN98_SHADOW
                 painter.setPen(fg)
                 inner = draw_rect.adjusted(8, 0, -8, 0)
                 painter.drawText(inner, Qt.AlignmentFlag.AlignVCenter,
@@ -426,7 +437,7 @@ class MailItemDelegate(QStyledItemDelegate):
         else:
             f4 = QFont(); f4.setPointSize(8)
             painter.setFont(f4)
-            painter.setPen(QColor("#9AA0A8"))
+            painter.setPen(muted_color)
             preview_rect = QRect(text_left, y4, text_width, self.CHIP_HEIGHT)
             preview = mail.preview or "(本文プレビューなし)"
             painter.drawText(preview_rect, Qt.AlignmentFlag.AlignVCenter,
@@ -436,24 +447,23 @@ class MailItemDelegate(QStyledItemDelegate):
 
     def _paint_header(self, painter, option, header: "MailGroupHeader"):
         painter.save()
-        painter.setRenderHint(painter.RenderHint.Antialiasing)
         rect = option.rect
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
 
-        painter.fillRect(rect, QColor("#E7EBF1") if hovered else QColor("#EFF2F6"))
-        painter.setPen(QColor("#D8DBE0"))
+        painter.fillRect(rect, WIN98_HOVER if hovered else WIN98_FACE)
+        painter.setPen(WIN98_SHADOW)
         painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
 
         arrow = "▼" if not header.collapsed else "▶"
         f_arrow = QFont(); f_arrow.setPointSize(9)
         painter.setFont(f_arrow)
-        painter.setPen(QColor("#6B7078"))
+        painter.setPen(WIN98_BLACK)
         arrow_rect = QRect(rect.left() + 16, rect.top(), 18, rect.height())
         painter.drawText(arrow_rect, Qt.AlignmentFlag.AlignVCenter, arrow)
 
         f_title = QFont(); f_title.setBold(True); f_title.setPointSize(9)
         painter.setFont(f_title)
-        painter.setPen(QColor("#2A2D33"))
+        painter.setPen(WIN98_BLACK)
         title_text = f"{header.title or '(件名なし)'}  ({len(header.mails)}件)"
         title_rect = QRect(rect.left() + 38, rect.top(), rect.width() - 54, rect.height())
         painter.drawText(title_rect, Qt.AlignmentFlag.AlignVCenter,
@@ -595,21 +605,22 @@ class SectionItemDelegate(QStyledItemDelegate):
             return super().paint(painter, option, index)
 
         painter.save()
-        painter.setRenderHint(painter.RenderHint.Antialiasing)
         rect = option.rect
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
 
         if selected:
-            painter.fillRect(rect, QColor("#E4EDFC"))
-            painter.fillRect(QRect(rect.left(), rect.top(), 3, rect.height()), QColor("#2F6FE4"))
+            painter.fillRect(rect, WIN98_SELECT_BG)
         elif hovered:
-            painter.fillRect(rect, QColor("#F5F7FA"))
+            painter.fillRect(rect, WIN98_HOVER)
         else:
-            painter.fillRect(rect, QColor("#FFFFFF"))
+            painter.fillRect(rect, WIN98_WHITE)
 
-        painter.setPen(QColor("#F0F1F3"))
+        painter.setPen(WIN98_SHADOW)
         painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+
+        text_color = WIN98_SELECT_FG if selected else WIN98_BLACK
+        muted_color = WIN98_SELECT_FG if selected else WIN98_SHADOW
 
         left = rect.left() + 6
         right = rect.right() - 12
@@ -633,20 +644,20 @@ class SectionItemDelegate(QStyledItemDelegate):
             max_bc_w = max(0, int((title_area_right - left) * 0.45))
             bc_text = fm_bc.elidedText(section.path_titles + "  ›  ", Qt.TextElideMode.ElideLeft, max_bc_w)
             painter.setFont(f_bc)
-            painter.setPen(QColor("#9AA0A8"))
+            painter.setPen(muted_color)
             bc_w = fm_bc.horizontalAdvance(bc_text)
             bc_rect = QRect(x, rect.top(), bc_w, rect.height())
             painter.drawText(bc_rect, Qt.AlignmentFlag.AlignVCenter, bc_text)
             x += bc_w
 
         painter.setFont(f_title)
-        painter.setPen(QColor("#16181D"))
+        painter.setPen(text_color)
         title_rect = QRect(x, rect.top(), max(10, title_area_right - x), rect.height())
         painter.drawText(title_rect, Qt.AlignmentFlag.AlignVCenter,
                           fm_title.elidedText(section.title, Qt.TextElideMode.ElideRight, title_rect.width()))
 
         painter.setFont(f_page)
-        painter.setPen(QColor("#9AA0A8"))
+        painter.setPen(muted_color)
         page_rect = QRect(right - page_w, rect.top(), page_w, rect.height())
         painter.drawText(page_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, page_text)
 
@@ -697,7 +708,7 @@ def _render_pdf_thumbnail(path: str, width: int) -> "QPixmap | None":
         pixmap = QPixmap.fromImage(image)
         # 白いページが背景に溶け込んで境界が分からなくなるため、枠線を描画しておく
         painter = QPainter(pixmap)
-        painter.setPen(QPen(QColor("#C7CBD1"), 1))
+        painter.setPen(QPen(WIN98_SHADOW, 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(0, 0, pixmap.width() - 1, pixmap.height() - 1)
         painter.end()
@@ -1621,7 +1632,7 @@ class WelcomeWidget(QWidget):
 
         guide = QLabel("PDFファイルをここにドラッグ&ドロップするか、下のボタンから開いてください。")
         guide.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        guide.setStyleSheet("color: #6B7078;")
+        guide.setStyleSheet("color: #000000;")
         outer.addWidget(guide)
 
         button_row = QHBoxLayout()
@@ -1636,7 +1647,7 @@ class WelcomeWidget(QWidget):
 
         self.favorites_label = QLabel("お気に入り")
         self.favorites_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.favorites_label.setStyleSheet("font-weight: 600; color: #2A2D33;")
+        self.favorites_label.setStyleSheet("font-weight: bold; color: #000000;")
         outer.addWidget(self.favorites_label)
         self.favorites_list = RecentPdfListWidget()
         self._wire_list(self.favorites_list)
@@ -1644,7 +1655,7 @@ class WelcomeWidget(QWidget):
 
         self.recent_label = QLabel("最近使ったPDF")
         self.recent_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.recent_label.setStyleSheet("font-weight: 600; color: #2A2D33;")
+        self.recent_label.setStyleSheet("font-weight: bold; color: #000000;")
         outer.addWidget(self.recent_label)
         self.recent_list = RecentPdfListWidget()
         self._wire_list(self.recent_list)
@@ -2181,25 +2192,89 @@ class MainWindow(QMainWindow):
             self._apply_fullscreen_chrome()
 
 
+# Windows 98風の配色・意匠(角丸なし、灰色フェイス+立体的な出っ張り/へこみ縁取り、紺の選択色)。
 APP_STYLESHEET = """
-QMainWindow { background: #FFFFFF; }
-QToolBar { background: #F7F8FA; border: none; padding: 6px; spacing: 4px; }
-QToolBar QLabel { color: #4A4F58; padding-left: 4px; }
-QLineEdit { border: 1px solid #D6D9DE; border-radius: 6px; padding: 5px 8px; background: #FFFFFF; }
-QLineEdit:focus { border: 1px solid #2F6FE4; }
-QComboBox { border: 1px solid #D6D9DE; border-radius: 6px; padding: 4px 8px; background: #FFFFFF; }
-QToolButton { border: 1px solid #D6D9DE; border-radius: 6px; padding: 5px 10px; background: #FFFFFF; }
-QToolButton:checked { background: #EAF1FE; border-color: #2F6FE4; color: #2F6FE4; }
-QStatusBar { background: #F7F8FA; color: #6B7078; }
-QListView, QTreeView { background: #FFFFFF; border: none; outline: 0; }
-QSplitter::handle { background: #E9EBEF; }
-#sortBar { background: #FBFCFD; border-bottom: 1px solid #E9EBEF; }
-#collapseBar { background: #FBFCFD; border-top: 1px solid #E9EBEF; }
-#pageLabel { color: #2A2D33; font-weight: 600; }
-#countLabel { color: #6B7078; }
-QTabWidget::pane { border: none; }
-QTabBar::tab { padding: 7px 16px; margin-right: 2px; background: #EEF0F3; border-top-left-radius: 6px; border-top-right-radius: 6px; }
-QTabBar::tab:selected { background: #FFFFFF; border: 1px solid #E9EBEF; border-bottom: none; }
+* { border-radius: 0px; }
+QWidget { background: #C0C0C0; color: #000000; font-family: "Tahoma", "MS UI Gothic", sans-serif; font-size: 9pt; }
+QMainWindow { background: #C0C0C0; }
+QToolBar { background: #C0C0C0; border: none; border-bottom: 2px outset #C0C0C0; padding: 3px; spacing: 3px; }
+QToolBar QLabel { color: #000000; padding-left: 4px; background: transparent; }
+QLabel { background: transparent; }
+
+QLineEdit {
+    border: 2px inset #C0C0C0;
+    padding: 3px 5px;
+    background: #FFFFFF;
+    color: #000000;
+    selection-background-color: #000080;
+    selection-color: #FFFFFF;
+}
+
+QComboBox {
+    border: 2px inset #C0C0C0;
+    padding: 3px 5px;
+    background: #FFFFFF;
+    color: #000000;
+}
+QComboBox::drop-down { border-left: 2px outset #C0C0C0; width: 18px; }
+QComboBox QAbstractItemView {
+    background: #FFFFFF;
+    border: 2px outset #C0C0C0;
+    selection-background-color: #000080;
+    selection-color: #FFFFFF;
+}
+
+QPushButton, QToolButton {
+    border: 2px outset #C0C0C0;
+    padding: 4px 10px;
+    background: #C0C0C0;
+    color: #000000;
+}
+QPushButton:pressed, QToolButton:pressed { border: 2px inset #C0C0C0; }
+QToolButton:checked { border: 2px inset #C0C0C0; background: #C0C0C0; }
+QPushButton:disabled, QToolButton:disabled { color: #808080; }
+
+QStatusBar { background: #C0C0C0; color: #000000; border-top: 2px outset #C0C0C0; }
+
+QListView, QTreeView {
+    background: #FFFFFF;
+    border: 2px inset #C0C0C0;
+    outline: 0;
+    color: #000000;
+}
+QListView::item:selected, QTreeView::item:selected { background: #000080; color: #FFFFFF; }
+
+QSplitter::handle { background: #C0C0C0; }
+QSplitter::handle:horizontal { width: 4px; }
+QSplitter::handle:vertical { height: 4px; }
+
+#sortBar, #collapseBar { background: #C0C0C0; border: none; }
+#pageLabel { color: #000000; font-weight: bold; }
+#countLabel { color: #000000; }
+
+QTabWidget::pane { border: 2px outset #C0C0C0; background: #C0C0C0; }
+QTabBar::tab {
+    background: #C0C0C0;
+    border: 2px outset #C0C0C0;
+    border-bottom: none;
+    padding: 5px 14px;
+    margin-right: 1px;
+    color: #000000;
+}
+QTabBar::tab:selected { background: #C0C0C0; }
+QTabBar::tab:!selected { margin-top: 2px; }
+
+QMenu { background: #C0C0C0; border: 2px outset #C0C0C0; color: #000000; }
+QMenu::item { padding: 4px 20px; }
+QMenu::item:selected { background: #000080; color: #FFFFFF; }
+QMenu::separator { height: 2px; background: #808080; margin: 2px 4px; }
+
+QScrollBar:vertical { background: #C0C0C0; width: 16px; border: none; }
+QScrollBar::handle:vertical { background: #C0C0C0; border: 2px outset #C0C0C0; min-height: 20px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { background: #C0C0C0; border: 2px outset #C0C0C0; height: 16px; }
+QScrollBar:horizontal { background: #C0C0C0; height: 16px; border: none; }
+QScrollBar::handle:horizontal { background: #C0C0C0; border: 2px outset #C0C0C0; min-width: 20px; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { background: #C0C0C0; border: 2px outset #C0C0C0; width: 16px; }
 """
 
 
