@@ -784,11 +784,11 @@ class BasePdfTab(QWidget):
         if not isinstance(window, QMainWindow) or not hasattr(window, "fullscreen_action"):
             return
         menu = QMenu(self)
+        sidebar_visible = self.sidebar.isVisible()
+        toggle_action = menu.addAction("しおり・メール一覧を隠す" if sidebar_visible else "しおり・メール一覧を表示")
+        toggle_action.triggered.connect(window._toggle_sidebar)
+        menu.addSeparator()
         if window.isFullScreen():
-            sidebar_visible = self.sidebar.isVisible()
-            toggle_action = menu.addAction("しおり・メール一覧を隠す" if sidebar_visible else "しおり・メール一覧を表示")
-            toggle_action.triggered.connect(window._toggle_fullscreen_sidebar)
-            menu.addSeparator()
             exit_action = menu.addAction("全画面表示を終了")
             exit_action.triggered.connect(lambda: window.fullscreen_action.setChecked(False))
         else:
@@ -1710,7 +1710,7 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("ukawa", "MailPDFViewer")
         self.setAcceptDrops(True)
         self._page_synced_tab: BasePdfTab | None = None
-        self._sidebar_visible_in_fullscreen = False
+        self._sidebar_visible = True  # メール一覧・しおり一覧の表示/非表示(全画面・通常表示どちらでも共通)
         self._child_windows: list[PageRangeWindow] = []
 
         self._build_ui()
@@ -1815,13 +1815,17 @@ class MainWindow(QMainWindow):
         self.next_page_button.clicked.connect(self.go_next_page)
         toolbar.addWidget(self.next_page_button)
 
+        self.sidebar_action = QAction("一覧を隠す", self)
+        self.sidebar_action.setToolTip("メール一覧・しおり一覧の表示/非表示を切り替え (Ctrl+B)")
+        self.sidebar_action.triggered.connect(self._toggle_sidebar)
+        toolbar.addAction(self.sidebar_action)
+
         toolbar.addSeparator()
         # アイコン(□に見える標準の最大化アイコン)ではなく文字で表示させるため、あえてアイコンを付けない
         # (QToolButtonはアイコンが無いアクションはテキストにフォールバックする)。
         self.fullscreen_action = QAction("全画面表示", self)
         self.fullscreen_action.setCheckable(True)
-        self.fullscreen_action.setToolTip(
-            "全画面表示を切り替え (F11)\n全画面中はCtrl+Bでメール一覧・しおりの表示/非表示を切り替え")
+        self.fullscreen_action.setToolTip("全画面表示を切り替え (F11)")
         self.fullscreen_action.toggled.connect(self._on_fullscreen_toggled)
         toolbar.addAction(self.fullscreen_action)
 
@@ -1834,7 +1838,7 @@ class MainWindow(QMainWindow):
         escape_shortcut.activated.connect(self._on_escape_pressed)
 
         sidebar_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
-        sidebar_shortcut.activated.connect(self._toggle_fullscreen_sidebar)
+        sidebar_shortcut.activated.connect(self._toggle_sidebar)
 
         prev_page_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
         prev_page_shortcut.activated.connect(self.go_prev_page)
@@ -2073,6 +2077,7 @@ class MainWindow(QMainWindow):
         self.search_box.setEnabled(has_tab)
         self.zoom_combo.setEnabled(has_tab)
         self.reindex_action.setEnabled(has_tab)
+        self.sidebar_action.setEnabled(has_tab)
 
     def _update_page_bar(self):
         tab = self._current_tab()
@@ -2124,27 +2129,29 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------- 全画面表示
     def _on_fullscreen_toggled(self, checked: bool):
         if checked:
-            self._sidebar_visible_in_fullscreen = False
+            # 全画面表示に入るときは、スライドショーのようにPDFを大きく見せるため
+            # 一覧を自動的に畳む(以後はCtrl+B/ボタンでの明示的な切り替えに従う)。
+            self._sidebar_visible = False
             self.showFullScreen()
         else:
             self.showNormal()
         self._apply_fullscreen_chrome()
 
-    def _toggle_fullscreen_sidebar(self):
-        """全画面表示中にCtrl+Bでメール一覧・しおりの表示/非表示を切り替える。"""
-        if not self.isFullScreen():
-            return
-        self._sidebar_visible_in_fullscreen = not self._sidebar_visible_in_fullscreen
+    def _toggle_sidebar(self):
+        """メール一覧・しおり一覧の表示/非表示を切り替える(全画面・通常表示どちらでも使える)。"""
+        self._sidebar_visible = not self._sidebar_visible
         self._apply_fullscreen_chrome()
 
     def _apply_fullscreen_chrome(self):
-        """全画面時はツールバー・ステータスバー・サイドバーを畳んで、PDF表示をスライドショーのように最大化する。"""
+        """全画面時はツールバー・ステータスバーを畳んで、PDF表示を大きく使う。一覧の表示/非表示は
+        全画面・通常表示に共通の状態(_sidebar_visible)に従う。"""
         full = self.isFullScreen()
         self.toolbar.setVisible(not full)
         self.status.setVisible(not full)
+        self.sidebar_action.setText("一覧を表示" if not self._sidebar_visible else "一覧を隠す")
         tab = self._current_tab()
         if isinstance(tab, BasePdfTab):
-            tab.set_sidebar_visible(True if not full else self._sidebar_visible_in_fullscreen)
+            tab.set_sidebar_visible(self._sidebar_visible)
 
     def changeEvent(self, event):
         super().changeEvent(event)
