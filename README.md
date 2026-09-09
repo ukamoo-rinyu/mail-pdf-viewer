@@ -37,6 +37,22 @@ pip install -r requirements.txt
 python main.py [PDFファイルパス]
 ```
 
+## 配布用exe化(PyInstaller)
+
+Pythonが入っていないPCでも動かせる単体exeを作れます。
+
+```bash
+pip install pyinstaller
+pyinstaller --noconfirm --onefile --windowed --name "MailPDFViewer" ^
+  --exclude-module pandas --exclude-module numpy --exclude-module PIL ^
+  --exclude-module matplotlib --exclude-module scipy --exclude-module numba ^
+  --exclude-module pyarrow --exclude-module IPython --exclude-module jupyter ^
+  --exclude-module notebook --exclude-module pytest ^
+  main.py
+```
+
+`dist/MailPDFViewer.exe` が生成されます(サイズ縮小のため、アプリが使っていない重量級パッケージ(pandas/numpy等がPython環境に別途入っている場合に誤って同梱されるのを防ぐため)を明示的に除外しています)。`build/`・`dist/`・`*.spec` は`.gitignore`済みのため、都度手元でビルドしてください。
+
 ## 構成
 
 ```

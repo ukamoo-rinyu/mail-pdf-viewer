@@ -4,3 +4,8 @@ __pycache__/
 # PDFとインデックスDBはテスト用の実データ(個人情報を含む)のため公開しない
 *.pdf
 *.sqlite3
+
+# PyInstallerのビルド生成物(exe化はREADME参照。手元でビルドする)
+build/
+dist/
+*.spec
