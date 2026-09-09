@@ -26,7 +26,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDragEnterEvent, QDropEvent, QFont, QFontMetrics, QKeySequence, QPainter, QPen, QShortcut, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDragEnterEvent, QDropEvent, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut, QStandardItem, QStandardItemModel
 from PySide6.QtPdf import QPdfDocument, QPdfSearchModel
 from PySide6.QtPdfWidgets import QPdfView
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
@@ -40,10 +40,14 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListView,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPushButton,
     QSplitter,
+    QStackedWidget,
     QStatusBar,
     QStyle,
     QStyledItemDelegate,
@@ -675,6 +679,26 @@ def _render_pages_to_printer(document: QPdfDocument, printer: QPrinter, start_pa
             painter.drawImage(x, y, image)
     finally:
         painter.end()
+
+
+def _render_pdf_thumbnail(path: str, width: int) -> "QPixmap | None":
+    """PDFの1ページ目を指定幅の縮小画像にして返す(開始画面のサムネイル用)。失敗時はNone。"""
+    doc = QPdfDocument()
+    try:
+        doc.load(path)
+        if doc.pageCount() < 1:
+            return None
+        pt_size = doc.pagePointSize(0)
+        if pt_size.width() <= 0 or pt_size.height() <= 0:
+            return None
+        scale = width / pt_size.width()
+        height = max(1, round(pt_size.height() * scale))
+        image = doc.render(0, QSize(width, height))
+        return QPixmap.fromImage(image)
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        doc.close()
 
 
 # --------------------------------------------------------- PDF表示・ページ送りの共通基底
@@ -1484,6 +1508,152 @@ class DocumentPdfTab(BasePdfTab):
             self._syncing_selection = False
 
 
+# ------------------------------------------------------------ 開始画面(PDF未オープン時)
+class RecentPdfListWidget(QListWidget):
+    """お気に入り/最近使ったPDFを、サムネイル付きで横に並べて表示する一覧。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setViewMode(QListWidget.ViewMode.IconMode)
+        self.setFlow(QListWidget.Flow.LeftToRight)
+        self.setWrapping(False)
+        self.setMovement(QListWidget.Movement.Static)
+        self.setIconSize(QSize(110, 142))
+        self.setGridSize(QSize(140, 176))
+        self.setSpacing(6)
+        self.setWordWrap(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setUniformItemSizes(True)
+        self.setFixedHeight(190)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+
+class WelcomeWidget(QWidget):
+    """PDFを1つも開いていないときに表示する開始画面。操作案内と、お気に入り/最近使った
+    PDFのサムネイル一覧を表示する(タブが無いと画面が真っ白になってしまうのを防ぐ)。"""
+
+    THUMB_WIDTH = 110
+
+    def __init__(self, window: "MainWindow", parent=None):
+        super().__init__(parent)
+        self._window = window
+        self._thumb_cache: dict[str, QPixmap] = {}  # f"{path}:{mtime}" -> サムネイル画像
+        self._build_ui()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(40, 32, 40, 32)
+        outer.setSpacing(16)
+        outer.addStretch(2)
+
+        title = QLabel("メールPDF閲覧アプリ")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        f = QFont()
+        f.setPointSize(18)
+        f.setBold(True)
+        title.setFont(f)
+        outer.addWidget(title)
+
+        guide = QLabel("PDFファイルをここにドラッグ&ドロップするか、下のボタンから開いてください。")
+        guide.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        guide.setStyleSheet("color: #6B7078;")
+        outer.addWidget(guide)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        open_button = QPushButton("PDFを開く")
+        open_button.clicked.connect(self._window.open_pdf_dialog)
+        button_row.addWidget(open_button)
+        button_row.addStretch(1)
+        outer.addLayout(button_row)
+
+        outer.addSpacing(12)
+
+        self.favorites_label = QLabel("お気に入り")
+        self.favorites_label.setStyleSheet("font-weight: 600; color: #2A2D33;")
+        outer.addWidget(self.favorites_label)
+        self.favorites_list = RecentPdfListWidget()
+        self._wire_list(self.favorites_list)
+        outer.addWidget(self.favorites_list)
+
+        self.recent_label = QLabel("最近使ったPDF")
+        self.recent_label.setStyleSheet("font-weight: 600; color: #2A2D33;")
+        outer.addWidget(self.recent_label)
+        self.recent_list = RecentPdfListWidget()
+        self._wire_list(self.recent_list)
+        outer.addWidget(self.recent_list)
+
+        outer.addStretch(3)
+
+    def _wire_list(self, list_widget: "RecentPdfListWidget"):
+        list_widget.itemActivated.connect(self._on_item_activated)
+        list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        list_widget.customContextMenuRequested.connect(
+            lambda pos, w=list_widget: self._show_context_menu(w, pos))
+
+    # ------------------------------------------------------------- 表示更新
+    def refresh(self):
+        self._populate(self.favorites_list, self._window.favorite_files())
+        self._populate(self.recent_list, self._window.recent_files())
+        has_favorites = self.favorites_list.count() > 0
+        has_recent = self.recent_list.count() > 0
+        self.favorites_label.setVisible(has_favorites)
+        self.favorites_list.setVisible(has_favorites)
+        self.recent_label.setVisible(has_recent)
+        self.recent_list.setVisible(has_recent)
+
+    def _populate(self, list_widget: "RecentPdfListWidget", paths: list[str]):
+        list_widget.clear()
+        for path in paths:
+            item = QListWidgetItem(os.path.basename(path))
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setToolTip(path)
+            pixmap = self._thumbnail_for(path)
+            if pixmap is not None:
+                item.setIcon(QIcon(pixmap))
+            list_widget.addItem(item)
+
+    def _thumbnail_for(self, path: str) -> "QPixmap | None":
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None
+        cache_key = f"{path}:{mtime}"
+        cached = self._thumb_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        pixmap = _render_pdf_thumbnail(path, self.THUMB_WIDTH)
+        if pixmap is not None:
+            self._thumb_cache[cache_key] = pixmap
+        return pixmap
+
+    # ------------------------------------------------------------- 操作
+    def _on_item_activated(self, item: "QListWidgetItem"):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path:
+            self._window.load_pdf(path)
+
+    def _show_context_menu(self, list_widget: "RecentPdfListWidget", pos):
+        item = list_widget.itemAt(pos)
+        if item is None:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+
+        menu = QMenu(self)
+        open_action = menu.addAction("開く")
+        open_action.triggered.connect(lambda: self._window.load_pdf(path))
+        menu.addSeparator()
+        if self._window.is_favorite(path):
+            fav_action = menu.addAction("お気に入りから外す")
+        else:
+            fav_action = menu.addAction("お気に入りに追加")
+        fav_action.triggered.connect(lambda: self._window.toggle_favorite(path))
+        menu.exec(list_widget.viewport().mapToGlobal(pos))
+
+
 # ------------------------------------------------------------------ 本体
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1518,7 +1688,15 @@ class MainWindow(QMainWindow):
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tabs.currentChanged.connect(self._on_current_tab_changed)
-        self.setCentralWidget(self.tabs)
+
+        # PDFを1つも開いていないとき、タブ領域が真っ白になるのを防ぐための開始画面。
+        self.welcome = WelcomeWidget(self)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.welcome)
+        self.stack.addWidget(self.tabs)
+        self.setCentralWidget(self.stack)
+        self.welcome.refresh()
 
     def _build_toolbar(self):
         toolbar = self.toolbar = QToolBar()
@@ -1545,6 +1723,13 @@ class MainWindow(QMainWindow):
                                        "再インデックス", self)
         self.reindex_action.triggered.connect(self.reindex_current)
         toolbar.addAction(self.reindex_action)
+
+        self.favorite_action = QAction("お気に入り", self)
+        self.favorite_action.setCheckable(True)
+        self.favorite_action.setEnabled(False)
+        self.favorite_action.setToolTip("開いているPDFをお気に入りに登録/解除")
+        self.favorite_action.triggered.connect(self._on_favorite_action_triggered)
+        toolbar.addAction(self.favorite_action)
 
         toolbar.addSeparator()
 
@@ -1634,6 +1819,9 @@ class MainWindow(QMainWindow):
     def _recent_files(self) -> list[str]:
         return [p for p in self.settings.value("recentFiles", [], type=list) if os.path.exists(p)]
 
+    def recent_files(self) -> list[str]:
+        return self._recent_files()
+
     def _add_recent_file(self, path: str):
         path = os.path.abspath(path)
         files = [p for p in self._recent_files() if os.path.abspath(p) != path]
@@ -1651,6 +1839,39 @@ class MainWindow(QMainWindow):
             action = self.recent_menu.addAction(os.path.basename(path))
             action.setToolTip(path)
             action.triggered.connect(lambda checked=False, p=path: self.load_pdf(p))
+
+    # --------------------------------------------------------------- お気に入り
+    def favorite_files(self) -> list[str]:
+        return [p for p in self.settings.value("favoriteFiles", [], type=list) if os.path.exists(p)]
+
+    def is_favorite(self, path: str) -> bool:
+        path = os.path.abspath(path)
+        return any(os.path.abspath(p) == path for p in self.favorite_files())
+
+    def toggle_favorite(self, path: str):
+        path = os.path.abspath(path)
+        current = self.favorite_files()
+        if any(os.path.abspath(p) == path for p in current):
+            updated = [p for p in current if os.path.abspath(p) != path]
+        else:
+            updated = current + [path]
+        self.settings.setValue("favoriteFiles", updated)
+        self._update_favorite_action()
+        if self.stack.currentWidget() is self.welcome:
+            self.welcome.refresh()
+
+    def _on_favorite_action_triggered(self, _checked: bool):
+        tab = self._current_tab()
+        if tab is not None:
+            self.toggle_favorite(tab.pdf_path)
+
+    def _update_favorite_action(self):
+        tab = self._current_tab()
+        is_fav = tab is not None and self.is_favorite(tab.pdf_path)
+        self.favorite_action.blockSignals(True)
+        self.favorite_action.setChecked(is_fav)
+        self.favorite_action.blockSignals(False)
+        self.favorite_action.setEnabled(tab is not None)
 
     # --------------------------------------------------------------- タブ管理
     def _find_tab_index(self, path: str) -> int:
@@ -1684,6 +1905,7 @@ class MainWindow(QMainWindow):
         idx = self.tabs.indexOf(tab)
         self.tabs.setTabToolTip(idx, path)
         self.tabs.setCurrentIndex(idx)
+        self.stack.setCurrentWidget(self.tabs)
         if ok:
             self._add_recent_file(path)
             unit = "件のメール" if isinstance(tab, PdfTab) else "件のしおり"
@@ -1714,6 +1936,9 @@ class MainWindow(QMainWindow):
         if tab is not None:
             tab.document.close()
             tab.deleteLater()
+        if self.tabs.count() == 0:
+            self.welcome.refresh()
+            self.stack.setCurrentWidget(self.welcome)
         self._update_controls_enabled()
 
     def _current_tab(self) -> BasePdfTab | None:
@@ -1735,6 +1960,7 @@ class MainWindow(QMainWindow):
         if tab is None:
             self._update_controls_enabled()
             self._update_page_bar()
+            self._update_favorite_action()
             return
 
         self._apply_fullscreen_chrome()
@@ -1757,6 +1983,7 @@ class MainWindow(QMainWindow):
         self.status.showMessage(f"{tab.result_count()} 件表示中{self._unread_suffix(tab)}")
         self._update_controls_enabled()
         self._update_page_bar()
+        self._update_favorite_action()
 
     def _update_controls_enabled(self):
         has_tab = self.tabs.count() > 0
