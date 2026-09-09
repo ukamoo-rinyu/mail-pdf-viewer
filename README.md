@@ -37,22 +37,6 @@ pip install -r requirements.txt
 python main.py [PDFファイルパス]
 ```
 
-## テストについて
-
-`test_*.py` はいずれもpytestではなく、実行して出力を目視確認するスクリプト形式です。
-
-メール束PDFを対象とするテスト(`test_db.py` / `test_parser.py` / `test_integration.py` など)は、
-個人情報を含む実際のメールPDFをフィクスチャとして使用するため、リポジトリには含めていません。
-手元の任意のメール束PDFを `../one_pdf_with_bookmarks2.pdf` などのファイル名で用意すれば実行できます。
-
-一般資料PDFモードのテスト(`test_document_mode.py`)は、ダミー内容のサンプルPDFのみを使うため、
-以下のコマンドでサンプルを生成すればそのまま実行できます。
-
-```bash
-python make_sample_document.py
-python test_document_mode.py
-```
-
 ## 構成
 
 ```
@@ -60,6 +44,4 @@ main.py                  # UI本体(PySide6)
 parser.py                # PDFしおり・本文の解析(メール束PDF / 一般資料PDF)
 db.py                    # SQLite(FTS5)によるインデックス構築・検索・既読状態の保存
 outlook_reply.py         # Outlook COM連携による返信下書き作成
-make_sample_document.py  # 資料モードのテスト用ダミーPDF生成
-test_*.py                # 動作確認用スクリプト
 ```
