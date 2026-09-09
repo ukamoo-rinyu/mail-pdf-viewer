@@ -845,6 +845,13 @@ class PageRangeWindow(QMainWindow):
         self.setCentralWidget(self.pdf_view)
 
         self._build_toolbar()
+        self.pdf_view.pageNavigator().currentPageChanged.connect(self._update_page_bar)
+        self._update_page_bar()
+
+        prev_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+        prev_shortcut.activated.connect(self.go_prev_page)
+        next_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
+        next_shortcut.activated.connect(self.go_next_page)
 
     def _build_toolbar(self):
         toolbar = QToolBar()
@@ -860,14 +867,34 @@ class PageRangeWindow(QMainWindow):
         toolbar.addWidget(zoom_combo)
 
         toolbar.addSeparator()
+        self.prev_page_button = QToolButton()
+        self.prev_page_button.setText("◀")
+        self.prev_page_button.setToolTip("前のページ (←)")
+        self.prev_page_button.clicked.connect(self.go_prev_page)
+        toolbar.addWidget(self.prev_page_button)
+
+        self.page_label = QLabel("- / -")
+        self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.page_label.setMinimumWidth(70)
+        toolbar.addWidget(self.page_label)
+
+        self.next_page_button = QToolButton()
+        self.next_page_button.setText("▶")
+        self.next_page_button.setToolTip("次のページ (→)")
+        self.next_page_button.clicked.connect(self.go_next_page)
+        toolbar.addWidget(self.next_page_button)
+
+        toolbar.addSeparator()
         print_action = toolbar.addAction("\U0001F5A8 印刷")
         print_action.triggered.connect(self._print)
 
         if self._attachments:
             toolbar.addSeparator()
+            mail_action = toolbar.addAction("\U0001F4E7 メール本文へ")
+            mail_action.triggered.connect(self._jump_to_mail_start)
+
             toolbar.addWidget(QLabel(" \U0001F4CE 添付ファイル: "))
             attach_combo = QComboBox()
-            attach_combo.addItem("ジャンプ...", None)
             for att in self._attachments:
                 attach_combo.addItem(att.name, att.start_page)
             attach_combo.setMinimumWidth(220)
@@ -876,9 +903,28 @@ class PageRangeWindow(QMainWindow):
                 lambda idx: self._jump_to_attachment(attach_combo.itemData(idx)))
             toolbar.addWidget(attach_combo)
 
-    def _jump_to_attachment(self, original_start_page: "int | None"):
-        if original_start_page is None:
-            return
+    # --------------------------------------------------------- ページ移動
+    def go_prev_page(self):
+        nav = self.pdf_view.pageNavigator()
+        if nav.currentPage() > 0:
+            nav.jump(nav.currentPage() - 1, QPointF(0, 0))
+
+    def go_next_page(self):
+        nav = self.pdf_view.pageNavigator()
+        if nav.currentPage() < self.document.pageCount() - 1:
+            nav.jump(nav.currentPage() + 1, QPointF(0, 0))
+
+    def _update_page_bar(self, *_args):
+        total = self.document.pageCount()
+        current = self.pdf_view.pageNavigator().currentPage() if total > 0 else -1
+        self.page_label.setText(f"{current + 1} / {total}" if total > 0 else "- / -")
+        self.prev_page_button.setEnabled(total > 0 and current > 0)
+        self.next_page_button.setEnabled(total > 0 and current < total - 1)
+
+    def _jump_to_mail_start(self):
+        self.pdf_view.pageNavigator().jump(0, QPointF(0, 0))
+
+    def _jump_to_attachment(self, original_start_page: int):
         local_page = original_start_page - self._start_page  # 抽出後PDFでの0始まりページ番号
         if 0 <= local_page < self.document.pageCount():
             self.pdf_view.pageNavigator().jump(local_page, QPointF(0, 0))
