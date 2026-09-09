@@ -826,7 +826,12 @@ class PageRangeWindow(QMainWindow):
                  attachments: "list[db.AttachmentInfo] | None" = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(820, 1000)
+        screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else None
+        if avail is not None:
+            self.resize(min(1180, int(avail.width() * 0.95)), min(1000, int(avail.height() * 0.9)))
+        else:
+            self.resize(1180, 1000)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._start_page = start_page
         self._attachments = [a for a in (attachments or []) if a.start_page is not None]
@@ -858,7 +863,7 @@ class PageRangeWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        toolbar.addWidget(QLabel(" 表示: "))
+        toolbar.addWidget(QLabel("表示:"))
         zoom_combo = QComboBox()
         zoom_combo.addItem("幅に合わせる", QPdfView.ZoomMode.FitToWidth)
         zoom_combo.addItem("ページ全体", QPdfView.ZoomMode.FitInView)
@@ -885,15 +890,15 @@ class PageRangeWindow(QMainWindow):
         toolbar.addWidget(self.next_page_button)
 
         toolbar.addSeparator()
-        print_action = toolbar.addAction("\U0001F5A8 印刷")
+        print_action = toolbar.addAction("印刷")
         print_action.triggered.connect(self._print)
 
         if self._attachments:
             toolbar.addSeparator()
-            mail_action = toolbar.addAction("\U0001F4E7 メール本文へ")
+            mail_action = toolbar.addAction("メール本文へ")
             mail_action.triggered.connect(self._jump_to_mail_start)
 
-            toolbar.addWidget(QLabel(" \U0001F4CE 添付ファイル: "))
+            toolbar.addWidget(QLabel("添付ファイル:"))
             attach_combo = QComboBox()
             for att in self._attachments:
                 attach_combo.addItem(att.name, att.start_page)
