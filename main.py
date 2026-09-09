@@ -2179,6 +2179,29 @@ class MainWindow(QMainWindow):
                 self.fullscreen_action.setChecked(is_full)
                 self.fullscreen_action.blockSignals(False)
             self._apply_fullscreen_chrome()
+            if not self.isMaximized() and not self.isFullScreen():
+                # 最大化を解除した直後は、以前のウィンドウサイズ・位置(別のモニターに
+                # 合わせたものかもしれない)に戻るため、一覧下部の「一覧を隠す」ボタン
+                # などが画面外に出ないよう現在の画面内に収まるよう調整する。
+                # サイズと位置の復元はOS側で別々の非同期処理として行われ、この
+                # イベント処理の直後やresizeEventの時点ではまだ両方とも確定していない
+                # ことがあるため、少し待ってから(両方の復元が完了した後に)実行する。
+                QTimer.singleShot(200, self._clamp_to_screen)
+
+    def _clamp_to_screen(self):
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        frame = self.frameGeometry()
+        width = min(frame.width(), avail.width())
+        height = min(frame.height(), avail.height())
+        x = min(max(frame.x(), avail.left()), avail.right() - width + 1)
+        y = min(max(frame.y(), avail.top()), avail.bottom() - height + 1)
+        if (width, height) != (frame.width(), frame.height()):
+            self.resize(width - (frame.width() - self.width()), height - (frame.height() - self.height()))
+        if (x, y) != (frame.x(), frame.y()):
+            self.move(x, y)
 
 
 APP_STYLESHEET = """
