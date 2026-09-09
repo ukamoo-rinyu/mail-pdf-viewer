@@ -11,9 +11,11 @@ from __future__ import annotations
 import os
 import re
 import sys
+import tempfile
 
 from PySide6.QtCore import (
     QAbstractListModel,
+    QCoreApplication,
     QEvent,
     QModelIndex,
     QPointF,
@@ -647,6 +649,34 @@ class SectionItemDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+def _render_pages_to_printer(document: QPdfDocument, printer: QPrinter, start_page: int, end_page: int):
+    """1始まりのページ範囲[start_page, end_page]をprinterへ描画する。BasePdfTab/MailWindowで共有する。"""
+    painter = QPainter()
+    if not painter.begin(printer):
+        return
+    try:
+        page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)
+        first = True
+        for page in range(start_page - 1, end_page):
+            if not first:
+                printer.newPage()
+            first = False
+
+            pt_size = document.pagePointSize(page)
+            if pt_size.width() <= 0 or pt_size.height() <= 0:
+                continue
+            scale = min(page_rect.width() / pt_size.width(), page_rect.height() / pt_size.height())
+            img_w = max(1, round(pt_size.width() * scale))
+            img_h = max(1, round(pt_size.height() * scale))
+            image = document.render(page, QSize(img_w, img_h))
+
+            x = round((page_rect.width() - img_w) / 2)
+            y = round((page_rect.height() - img_h) / 2)
+            painter.drawImage(x, y, image)
+    finally:
+        painter.end()
+
+
 # --------------------------------------------------------- PDF表示・ページ送りの共通基底
 class BasePdfTab(QWidget):
     """PDF描画・ページ送り・印刷など、メール束PDF/一般資料PDFで共通する部分。"""
@@ -737,30 +767,7 @@ class BasePdfTab(QWidget):
 
     def render_page_range_to_printer(self, printer: QPrinter, start_page: int, end_page: int):
         """1始まりのページ範囲[start_page, end_page]をprinterへ描画する(印刷ダイアログとは独立してテスト可能)。"""
-        painter = QPainter()
-        if not painter.begin(printer):
-            return
-        try:
-            page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)
-            first = True
-            for page in range(start_page - 1, end_page):
-                if not first:
-                    printer.newPage()
-                first = False
-
-                pt_size = self.document.pagePointSize(page)
-                if pt_size.width() <= 0 or pt_size.height() <= 0:
-                    continue
-                scale = min(page_rect.width() / pt_size.width(), page_rect.height() / pt_size.height())
-                img_w = max(1, round(pt_size.width() * scale))
-                img_h = max(1, round(pt_size.height() * scale))
-                image = self.document.render(page, QSize(img_w, img_h))
-
-                x = round((page_rect.width() - img_w) / 2)
-                y = round((page_rect.height() - img_h) / 2)
-                painter.drawImage(x, y, image)
-        finally:
-            painter.end()
+        _render_pages_to_printer(self.document, printer, start_page, end_page)
 
     # --------------------------------------------------------------- 保存
     def save_page_range(self, start_page: int, end_page: int, suggested_name: str):
@@ -805,6 +812,75 @@ class BasePdfTab(QWidget):
 
     def _sync_selection_to_page(self, page: int):
         """PDFのスクロール(ページ送り)に追従して一覧側の選択を更新する。サブクラスで実装する。"""
+
+
+class MailWindow(QMainWindow):
+    """メール一覧から切り離して1件だけを表示する、独立した閲覧用ウィンドウ。
+
+    元PDFから該当ページ範囲だけを一時ファイルへ抽出して表示する(メイン一覧の
+    QPdfDocumentと共有すると、双方のページ送りが干渉してしまうため)。ウィンドウを
+    閉じると一時ファイルは削除する。
+    """
+
+    def __init__(self, title: str, pdf_path: str, start_page: int, end_page: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(820, 1000)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        fd, self._tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="mailpdf_")
+        os.close(fd)
+        parser.save_page_range(pdf_path, self._tmp_path, start_page, end_page)
+
+        self.document = QPdfDocument(self)
+        self.document.load(self._tmp_path)
+
+        self.pdf_view = QPdfView()
+        self.pdf_view.setDocument(self.document)
+        self.pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
+        self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        self.setCentralWidget(self.pdf_view)
+
+        self._build_toolbar()
+
+    def _build_toolbar(self):
+        toolbar = QToolBar()
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+
+        toolbar.addWidget(QLabel(" 表示: "))
+        zoom_combo = QComboBox()
+        zoom_combo.addItem("幅に合わせる", QPdfView.ZoomMode.FitToWidth)
+        zoom_combo.addItem("ページ全体", QPdfView.ZoomMode.FitInView)
+        zoom_combo.currentIndexChanged.connect(
+            lambda: self.pdf_view.setZoomMode(zoom_combo.currentData()))
+        toolbar.addWidget(zoom_combo)
+
+        toolbar.addSeparator()
+        print_action = toolbar.addAction("\U0001F5A8 印刷")
+        print_action.triggered.connect(self._print)
+
+    def _print(self):
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dialog = QPrintDialog(printer, self)
+        dialog.setWindowTitle("印刷")
+        if dialog.exec() != QPrintDialog.DialogCode.Accepted:
+            return
+        _render_pages_to_printer(self.document, printer, 1, self.document.pageCount())
+
+    def closeEvent(self, event):
+        super().closeEvent(event)
+        # QPdfDocument.close()だけではpdfiumが一時ファイルのハンドルを保持し続け、
+        # 直後のos.remove()がWindowsで失敗する(WinError 32)ため、documentを明示的に
+        # 破棄してから削除する。
+        self.pdf_view.setDocument(None)
+        self.document.close()
+        self.document.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        try:
+            os.remove(self._tmp_path)
+        except OSError:
+            pass
 
 
 # -------------------------------------------------------------- 1PDF分のタブ(メール)
@@ -877,6 +953,7 @@ class PdfTab(BasePdfTab):
         self.list_view.setFrameShape(QFrame.Shape.NoFrame)
         self.list_view.setAlternatingRowColors(False)
         self.list_view.clicked.connect(self._on_index_activated)
+        self.list_view.doubleClicked.connect(self._on_index_double_clicked)
         self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self._show_context_menu)
         left_layout.addWidget(self.list_view)
@@ -976,6 +1053,15 @@ class PdfTab(BasePdfTab):
         self._mark_read(mail)
         self.pdf_view.pageNavigator().jump(mail.start_page - 1, QPointF(0, 0))
 
+    def _on_index_double_clicked(self, index: QModelIndex):
+        if not index.isValid() or self.model.is_empty() or self.model.header_at(index.row()) is not None:
+            return
+        mail = self.model.mail_at(index.row())
+        if mail is None:
+            return
+        self._mark_read(mail)
+        self._open_mail_window(mail)
+
     def _on_attachment_clicked(self, index: QModelIndex, start_page: int):
         self.list_view.setCurrentIndex(index)
         mail = self.model.mail_at(index.row())
@@ -1017,6 +1103,10 @@ class PdfTab(BasePdfTab):
         reply_all_action.triggered.connect(lambda: self._create_outlook_reply(mail, reply_all=True))
         menu.addSeparator()
 
+        window_action = menu.addAction("\U0001F5D4 別ウインドウで開く")
+        window_action.triggered.connect(lambda: self._open_mail_window(mail))
+        menu.addSeparator()
+
         page_range = f"{mail.start_page}" if mail.start_page == mail.end_page else f"{mail.start_page}-{mail.end_page}"
         mail_name = f"{mail.subject or '(件名なし)'}"
         mail_action = menu.addAction(f"\U0001F5A8 このメールを印刷... ({page_range}ページ)")
@@ -1041,6 +1131,13 @@ class PdfTab(BasePdfTab):
                     lambda checked=False, s=att.start_page, e=end, n=att.name: self.save_page_range(s, e, n))
 
         menu.exec(self.list_view.viewport().mapToGlobal(pos))
+
+    def _open_mail_window(self, mail: "db.MailRow"):
+        window = self.window()
+        if not isinstance(window, MainWindow):
+            return
+        title = f"{mail.sender_short or '(差出人不明)'} - {mail.subject or '(件名なし)'}"
+        window.open_mail_window(title, self.pdf_path, mail.start_page, mail.end_page)
 
     def _create_outlook_reply(self, mail: "db.MailRow", reply_all: bool = False):
         body_text = db.get_body_text(self.db_path, mail.id) if self.db_path else ""
@@ -1282,6 +1379,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self._page_synced_tab: BasePdfTab | None = None
         self._sidebar_visible_in_fullscreen = False
+        self._mail_windows: list[MailWindow] = []
 
         self._build_ui()
         self._update_controls_enabled()
@@ -1378,8 +1476,10 @@ class MainWindow(QMainWindow):
         find_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
         find_shortcut.activated.connect(lambda: (self.search_box.setFocus(), self.search_box.selectAll()))
 
-        escape_shortcut = QShortcut(QKeySequence("Esc"), self.search_box)
-        escape_shortcut.activated.connect(self.search_box.clear)
+        # 全画面表示中はツールバー(search_boxの置き場所)ごと非表示になるため、search_box
+        # ではなくウィンドウ直付けのQShortcutにする(F11と同じ理由)。
+        escape_shortcut = QShortcut(QKeySequence("Esc"), self)
+        escape_shortcut.activated.connect(self._on_escape_pressed)
 
         sidebar_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
         sidebar_shortcut.activated.connect(self._toggle_fullscreen_sidebar)
@@ -1464,6 +1564,21 @@ class MainWindow(QMainWindow):
                 f"{tab.result_count()} {unit}を読み込みました{self._unread_suffix(tab)}", 5000)
         self._update_controls_enabled()
         self._update_page_bar()
+
+    # --------------------------------------------------------------- 別ウインドウ表示
+    def open_mail_window(self, title: str, pdf_path: str, start_page: int, end_page: int):
+        try:
+            win = MailWindow(title, pdf_path, start_page, end_page)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "別ウインドウで開けませんでした", f"詳細: {e}")
+            return
+        self._mail_windows.append(win)
+        win.destroyed.connect(lambda _=None, w=win: self._forget_mail_window(w))
+        win.show()
+
+    def _forget_mail_window(self, win: "MailWindow"):
+        if win in self._mail_windows:
+            self._mail_windows.remove(win)
 
     def _close_tab(self, index: int):
         tab = self.tabs.widget(index)
@@ -1560,6 +1675,13 @@ class MainWindow(QMainWindow):
         tab = self._current_tab()
         if tab is not None:
             tab.go_next_page()
+
+    def _on_escape_pressed(self):
+        """全画面表示中はEscで解除、それ以外は検索ボックスをクリアする。"""
+        if self.isFullScreen():
+            self.fullscreen_action.setChecked(False)
+        else:
+            self.search_box.clear()
 
     # --------------------------------------------------------------- 全画面表示
     def _on_fullscreen_toggled(self, checked: bool):
