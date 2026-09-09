@@ -1448,7 +1448,7 @@ class MainWindow(QMainWindow):
 
         self.prev_page_button = QToolButton()
         self.prev_page_button.setText("◀")
-        self.prev_page_button.setToolTip("前のページ")
+        self.prev_page_button.setToolTip("前のページ (←)")
         self.prev_page_button.clicked.connect(self.go_prev_page)
         toolbar.addWidget(self.prev_page_button)
 
@@ -1460,13 +1460,14 @@ class MainWindow(QMainWindow):
 
         self.next_page_button = QToolButton()
         self.next_page_button.setText("▶")
-        self.next_page_button.setToolTip("次のページ")
+        self.next_page_button.setToolTip("次のページ (→)")
         self.next_page_button.clicked.connect(self.go_next_page)
         toolbar.addWidget(self.next_page_button)
 
         toolbar.addSeparator()
-        self.fullscreen_action = QAction(
-            style.standardIcon(QStyle.StandardPixmap.SP_TitleBarMaxButton), "全画面表示", self)
+        # アイコン(□に見える標準の最大化アイコン)ではなく文字で表示させるため、あえてアイコンを付けない
+        # (QToolButtonはアイコンが無いアクションはテキストにフォールバックする)。
+        self.fullscreen_action = QAction("全画面表示", self)
         self.fullscreen_action.setCheckable(True)
         self.fullscreen_action.setToolTip(
             "全画面表示を切り替え (F11)\n全画面中はCtrl+Bでメール一覧・しおりの表示/非表示を切り替え")
@@ -1483,6 +1484,11 @@ class MainWindow(QMainWindow):
 
         sidebar_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
         sidebar_shortcut.activated.connect(self._toggle_fullscreen_sidebar)
+
+        prev_page_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+        prev_page_shortcut.activated.connect(self.go_prev_page)
+        next_page_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
+        next_page_shortcut.activated.connect(self.go_next_page)
 
         # 全画面表示中はツールバー(fullscreen_actionの置き場所)ごと非表示になり、
         # QActionにぶら下げたショートカットだけでは復帰できなくなるため、ウィンドウ直付けのQShortcutにする。
@@ -1743,7 +1749,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(APP_STYLESHEET)
     win = MainWindow()
-    win.show()
+    win.showMaximized()
     if len(sys.argv) > 1:
         win.load_pdf(sys.argv[1])
     sys.exit(app.exec())
