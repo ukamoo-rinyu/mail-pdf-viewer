@@ -966,7 +966,10 @@ class PageRangeWindow(QMainWindow):
                 attach_combo.addItem(att.name, att.start_page)
             attach_combo.setMinimumWidth(220)
             attach_combo.setMaximumWidth(360)
-            attach_combo.currentIndexChanged.connect(
+            # currentIndexChangedだと、既定で選択状態になる先頭(1件目)を選んでも
+            # インデックスが変化しないため反応しない。activatedならユーザーが選ぶたびに
+            # (選び直しでも)発火するのでこちらを使う。
+            attach_combo.activated.connect(
                 lambda idx: self._jump_to_attachment(attach_combo.itemData(idx)))
             toolbar.addWidget(attach_combo)
 
