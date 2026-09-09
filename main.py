@@ -650,7 +650,7 @@ class SectionItemDelegate(QStyledItemDelegate):
 
 
 def _render_pages_to_printer(document: QPdfDocument, printer: QPrinter, start_page: int, end_page: int):
-    """1始まりのページ範囲[start_page, end_page]をprinterへ描画する。BasePdfTab/MailWindowで共有する。"""
+    """1始まりのページ範囲[start_page, end_page]をprinterへ描画する。BasePdfTab/PageRangeWindowで共有する。"""
     painter = QPainter()
     if not painter.begin(printer):
         return
@@ -814,19 +814,22 @@ class BasePdfTab(QWidget):
         """PDFのスクロール(ページ送り)に追従して一覧側の選択を更新する。サブクラスで実装する。"""
 
 
-class MailWindow(QMainWindow):
-    """メール一覧から切り離して1件だけを表示する、独立した閲覧用ウィンドウ。
+class PageRangeWindow(QMainWindow):
+    """一覧から切り離して1件(1メール、または資料PDFの1しおり区間)だけを表示する、独立した閲覧用ウィンドウ。
 
     元PDFから該当ページ範囲だけを一時ファイルへ抽出して表示する(メイン一覧の
     QPdfDocumentと共有すると、双方のページ送りが干渉してしまうため)。ウィンドウを
     閉じると一時ファイルは削除する。
     """
 
-    def __init__(self, title: str, pdf_path: str, start_page: int, end_page: int, parent=None):
+    def __init__(self, title: str, pdf_path: str, start_page: int, end_page: int,
+                 attachments: "list[db.AttachmentInfo] | None" = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(820, 1000)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._start_page = start_page
+        self._attachments = [a for a in (attachments or []) if a.start_page is not None]
 
         fd, self._tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="mailpdf_")
         os.close(fd)
@@ -859,6 +862,26 @@ class MailWindow(QMainWindow):
         toolbar.addSeparator()
         print_action = toolbar.addAction("\U0001F5A8 印刷")
         print_action.triggered.connect(self._print)
+
+        if self._attachments:
+            toolbar.addSeparator()
+            toolbar.addWidget(QLabel(" \U0001F4CE 添付ファイル: "))
+            attach_combo = QComboBox()
+            attach_combo.addItem("ジャンプ...", None)
+            for att in self._attachments:
+                attach_combo.addItem(att.name, att.start_page)
+            attach_combo.setMinimumWidth(220)
+            attach_combo.setMaximumWidth(360)
+            attach_combo.currentIndexChanged.connect(
+                lambda idx: self._jump_to_attachment(attach_combo.itemData(idx)))
+            toolbar.addWidget(attach_combo)
+
+    def _jump_to_attachment(self, original_start_page: "int | None"):
+        if original_start_page is None:
+            return
+        local_page = original_start_page - self._start_page  # 抽出後PDFでの0始まりページ番号
+        if 0 <= local_page < self.document.pageCount():
+            self.pdf_view.pageNavigator().jump(local_page, QPointF(0, 0))
 
     def _print(self):
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
@@ -1137,7 +1160,8 @@ class PdfTab(BasePdfTab):
         if not isinstance(window, MainWindow):
             return
         title = f"{mail.sender_short or '(差出人不明)'} - {mail.subject or '(件名なし)'}"
-        window.open_mail_window(title, self.pdf_path, mail.start_page, mail.end_page)
+        window.open_page_range_window(title, self.pdf_path, mail.start_page, mail.end_page,
+                                       attachments=mail.attachment_list())
 
     def _create_outlook_reply(self, mail: "db.MailRow", reply_all: bool = False):
         body_text = db.get_body_text(self.db_path, mail.id) if self.db_path else ""
@@ -1254,6 +1278,7 @@ class DocumentPdfTab(BasePdfTab):
         self.list_view.setFrameShape(QFrame.Shape.NoFrame)
         self.list_view.setAnimated(True)
         self.list_view.clicked.connect(self._on_index_activated)
+        self.list_view.doubleClicked.connect(self._on_index_double_clicked)
         self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self._show_context_menu)
         left_layout.addWidget(self.list_view)
@@ -1316,6 +1341,14 @@ class DocumentPdfTab(BasePdfTab):
             return
         self.pdf_view.pageNavigator().jump(section.start_page - 1, QPointF(0, 0))
 
+    def _on_index_double_clicked(self, index: QModelIndex):
+        if not index.isValid() or self.model.is_empty():
+            return
+        section = self.model.section_at(index)
+        if section is None:
+            return
+        self._open_section_window(section)
+
     def _show_context_menu(self, pos):
         index = self.list_view.indexAt(pos)
         if not index.isValid():
@@ -1328,12 +1361,24 @@ class DocumentPdfTab(BasePdfTab):
         menu = QMenu(self)
         page_range = (f"{section.start_page}" if section.start_page == section.end_page
                       else f"{section.start_page}-{section.end_page}")
+
+        window_action = menu.addAction("\U0001F5D4 別ウインドウで開く")
+        window_action.triggered.connect(lambda: self._open_section_window(section))
+        menu.addSeparator()
+
         print_action = menu.addAction(f"\U0001F5A8 この区間を印刷... ({page_range}ページ)")
         print_action.triggered.connect(lambda: self.print_page_range(section.start_page, section.end_page))
         save_action = menu.addAction(f"\U0001F4BE この区間をPDFで保存... ({page_range}ページ)")
         save_action.triggered.connect(
             lambda: self.save_page_range(section.start_page, section.end_page, section.title))
         menu.exec(self.list_view.viewport().mapToGlobal(pos))
+
+    def _open_section_window(self, section: "db.SectionRow"):
+        window = self.window()
+        if not isinstance(window, MainWindow):
+            return
+        window.open_page_range_window(section.title or "(見出しなし)", self.pdf_path,
+                                       section.start_page, section.end_page)
 
     def _find_index_for_page(self, page: int, parent: QModelIndex = QModelIndex()) -> QModelIndex | None:
         """0始まりのページ番号を含む、最も深い(範囲が狭い)しおりを木構造から探す。"""
@@ -1379,7 +1424,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self._page_synced_tab: BasePdfTab | None = None
         self._sidebar_visible_in_fullscreen = False
-        self._mail_windows: list[MailWindow] = []
+        self._child_windows: list[PageRangeWindow] = []
 
         self._build_ui()
         self._update_controls_enabled()
@@ -1572,19 +1617,20 @@ class MainWindow(QMainWindow):
         self._update_page_bar()
 
     # --------------------------------------------------------------- 別ウインドウ表示
-    def open_mail_window(self, title: str, pdf_path: str, start_page: int, end_page: int):
+    def open_page_range_window(self, title: str, pdf_path: str, start_page: int, end_page: int,
+                                attachments: "list[db.AttachmentInfo] | None" = None):
         try:
-            win = MailWindow(title, pdf_path, start_page, end_page)
+            win = PageRangeWindow(title, pdf_path, start_page, end_page, attachments=attachments)
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "別ウインドウで開けませんでした", f"詳細: {e}")
             return
-        self._mail_windows.append(win)
-        win.destroyed.connect(lambda _=None, w=win: self._forget_mail_window(w))
+        self._child_windows.append(win)
+        win.destroyed.connect(lambda _=None, w=win: self._forget_child_window(w))
         win.show()
 
-    def _forget_mail_window(self, win: "MailWindow"):
-        if win in self._mail_windows:
-            self._mail_windows.remove(win)
+    def _forget_child_window(self, win: "PageRangeWindow"):
+        if win in self._child_windows:
+            self._child_windows.remove(win)
 
     def _close_tab(self, index: int):
         tab = self.tabs.widget(index)
