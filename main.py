@@ -777,6 +777,28 @@ class BasePdfTab(QWidget):
     def set_sidebar_visible(self, visible: bool):
         self.sidebar.setVisible(visible)
 
+    def _request_toggle_sidebar(self):
+        """一覧の下にある「一覧を隠す」ボタンから呼ばれる。実際の表示状態はMainWindow側で
+        一元管理しているため、そちらのトグル処理を呼び出す(Ctrl+B/右クリックと共通)。"""
+        window = self.window()
+        if isinstance(window, QMainWindow) and hasattr(window, "_toggle_sidebar"):
+            window._toggle_sidebar()
+
+    def _build_collapse_bar(self) -> QWidget:
+        """一覧の下に置く「一覧を隠す」ボタンのバー。"""
+        bar = QWidget()
+        bar.setObjectName("collapseBar")
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(12, 6, 12, 6)
+        layout.addStretch(1)
+        button = QToolButton()
+        button.setText("一覧を隠す")
+        button.setToolTip("メール一覧・しおり一覧を隠す (Ctrl+Bで再表示)")
+        button.clicked.connect(self._request_toggle_sidebar)
+        layout.addWidget(button)
+        layout.addStretch(1)
+        return bar
+
     def _show_pdf_context_menu(self, pos):
         """PDF表示部分の右クリックメニュー。全画面表示中はしおり呼び出し・全画面解除の導線が
         ツールバーから消えてしまうため、ここから操作できるようにする。"""
@@ -1099,6 +1121,7 @@ class PdfTab(BasePdfTab):
         self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self._show_context_menu)
         left_layout.addWidget(self.list_view)
+        left_layout.addWidget(self._build_collapse_bar())
         self.sidebar = left
         splitter.addWidget(left)
 
@@ -1405,6 +1428,7 @@ class DocumentPdfTab(BasePdfTab):
         self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self._show_context_menu)
         left_layout.addWidget(self.list_view)
+        left_layout.addWidget(self._build_collapse_bar())
         self.sidebar = left
         splitter.addWidget(left)
 
@@ -1815,11 +1839,6 @@ class MainWindow(QMainWindow):
         self.next_page_button.clicked.connect(self.go_next_page)
         toolbar.addWidget(self.next_page_button)
 
-        self.sidebar_action = QAction("一覧を隠す", self)
-        self.sidebar_action.setToolTip("メール一覧・しおり一覧の表示/非表示を切り替え (Ctrl+B)")
-        self.sidebar_action.triggered.connect(self._toggle_sidebar)
-        toolbar.addAction(self.sidebar_action)
-
         toolbar.addSeparator()
         # アイコン(□に見える標準の最大化アイコン)ではなく文字で表示させるため、あえてアイコンを付けない
         # (QToolButtonはアイコンが無いアクションはテキストにフォールバックする)。
@@ -2077,7 +2096,6 @@ class MainWindow(QMainWindow):
         self.search_box.setEnabled(has_tab)
         self.zoom_combo.setEnabled(has_tab)
         self.reindex_action.setEnabled(has_tab)
-        self.sidebar_action.setEnabled(has_tab)
 
     def _update_page_bar(self):
         tab = self._current_tab()
@@ -2148,7 +2166,6 @@ class MainWindow(QMainWindow):
         full = self.isFullScreen()
         self.toolbar.setVisible(not full)
         self.status.setVisible(not full)
-        self.sidebar_action.setText("一覧を表示" if not self._sidebar_visible else "一覧を隠す")
         tab = self._current_tab()
         if isinstance(tab, BasePdfTab):
             tab.set_sidebar_visible(self._sidebar_visible)
@@ -2177,6 +2194,7 @@ QStatusBar { background: #F7F8FA; color: #6B7078; }
 QListView, QTreeView { background: #FFFFFF; border: none; outline: 0; }
 QSplitter::handle { background: #E9EBEF; }
 #sortBar { background: #FBFCFD; border-bottom: 1px solid #E9EBEF; }
+#collapseBar { background: #FBFCFD; border-top: 1px solid #E9EBEF; }
 #pageLabel { color: #2A2D33; font-weight: 600; }
 #countLabel { color: #6B7078; }
 QTabWidget::pane { border: none; }
