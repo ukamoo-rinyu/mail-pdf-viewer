@@ -715,6 +715,22 @@ class BasePdfTab(QWidget):
     def set_sidebar_visible(self, visible: bool):
         self.sidebar.setVisible(visible)
 
+    def _set_initial_splitter_ratio(self, splitter: QSplitter, left_ratio: float):
+        """一覧側の初期幅をsplitter全体幅に対する比率で設定する。
+
+        構築直後はsplitterがまだ実際の幅を持っておらずsetSizes()に絶対的な小さい値
+        (例:[300, 700])を渡しても比率通りに解釈されない(Qtは値を比率としてではなく
+        現在の幅からの差分として扱うため)。そのため、最初のレイアウト後(イベント
+        ループの次のティック)に実際の幅から計算したピクセル値で設定し直す。
+        """
+        def apply():
+            total = splitter.width()
+            if total <= 0:
+                return
+            left = round(total * left_ratio)
+            splitter.setSizes([left, total - left])
+        QTimer.singleShot(0, apply)
+
     def _show_pdf_context_menu(self, pos):
         """PDF表示部分の右クリックメニュー。全画面表示中はしおり呼び出し・全画面解除の導線が
         ツールバーから消えてしまうため、ここから操作できるようにする。"""
@@ -1011,6 +1027,9 @@ class PdfTab(BasePdfTab):
         sort_layout.addWidget(self.group_button)
 
         sort_layout.addStretch(1)
+        self.count_label = QLabel()
+        self.count_label.setObjectName("countLabel")
+        sort_layout.addWidget(self.count_label)
         self._update_sort_dir_label()
         left_layout.addWidget(sort_bar)
 
@@ -1035,8 +1054,9 @@ class PdfTab(BasePdfTab):
         splitter.addWidget(left)
 
         splitter.addWidget(self.pdf_view)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 7)
+        self._set_initial_splitter_ratio(splitter, 0.3)
 
         self.list_view.selectionModel().currentChanged.connect(self._on_index_activated)
 
@@ -1063,11 +1083,15 @@ class PdfTab(BasePdfTab):
             if self.db_path else []
         )
         self.model.set_rows(rows, grouped=self.group_by_subject)
+        self._update_count_label()
         first = self.model.first_mail_index()
         if first.isValid():
             self.list_view.setCurrentIndex(first)
         else:
             self.pdf_view.pageNavigator().jump(0, QPointF(0, 0))
+
+    def _update_count_label(self):
+        self.count_label.setText(f"{len(self.model.all_rows())} 件")
 
     def result_count(self) -> int:
         return self.model.rowCount()
@@ -1337,8 +1361,9 @@ class DocumentPdfTab(BasePdfTab):
         splitter.addWidget(left)
 
         splitter.addWidget(self.pdf_view)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 7)
+        self._set_initial_splitter_ratio(splitter, 0.3)
 
         self.list_view.selectionModel().currentChanged.connect(self._on_index_activated)
 
@@ -1836,6 +1861,7 @@ QListView, QTreeView { background: #FFFFFF; border: none; outline: 0; }
 QSplitter::handle { background: #E9EBEF; }
 #sortBar { background: #FBFCFD; border-bottom: 1px solid #E9EBEF; }
 #pageLabel { color: #2A2D33; font-weight: 600; }
+#countLabel { color: #6B7078; }
 QTabWidget::pane { border: none; }
 QTabBar::tab { padding: 7px 16px; margin-right: 2px; background: #EEF0F3; border-top-left-radius: 6px; border-top-right-radius: 6px; }
 QTabBar::tab:selected { background: #FFFFFF; border: 1px solid #E9EBEF; border-bottom: none; }
