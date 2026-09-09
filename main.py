@@ -47,7 +47,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
-    QStackedWidget,
     QStatusBar,
     QStyle,
     QStyledItemDelegate,
@@ -694,11 +693,49 @@ def _render_pdf_thumbnail(path: str, width: int) -> "QPixmap | None":
         scale = width / pt_size.width()
         height = max(1, round(pt_size.height() * scale))
         image = doc.render(0, QSize(width, height))
-        return QPixmap.fromImage(image)
+        pixmap = QPixmap.fromImage(image)
+        # 白いページが背景に溶け込んで境界が分からなくなるため、枠線を描画しておく
+        painter = QPainter(pixmap)
+        painter.setPen(QPen(QColor("#C7CBD1"), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(0, 0, pixmap.width() - 1, pixmap.height() - 1)
+        painter.end()
+        return pixmap
     except Exception:  # noqa: BLE001
         return None
     finally:
         doc.close()
+
+
+class RatioSplitter(QSplitter):
+    """一覧側の幅を、常に全体幅に対する比率で保つQSplitter(ユーザーが手動で
+    ドラッグするまでは)。
+
+    構築直後やウィンドウ最大化中はまだ実際の幅が確定しておらず、setSizes()に絶対値
+    を渡しても比率通りに解釈されない(Qtは値を比率としてではなく現在の幅からの差分
+    として扱うため)。また、OS側のウィンドウ最大化はQtのイベントループの1ティックで
+    確定するとは限らず、最初のresizeEventがまだ最大化前の暫定サイズのことがある。
+    そのため一度きりの適用にはせず、ユーザーがハンドルを手動でドラッグするまでは
+    リサイズのたびに比率を再適用する。
+    """
+
+    def __init__(self, orientation: Qt.Orientation, left_ratio: float, parent=None):
+        super().__init__(orientation, parent)
+        self._left_ratio = left_ratio
+        self._user_moved = False
+        self.splitterMoved.connect(self._on_user_moved)
+
+    def _on_user_moved(self, _pos: int, _index: int):
+        self._user_moved = True
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._user_moved:
+            return
+        total = event.size().width()
+        if total > 0:
+            left = round(total * self._left_ratio)
+            self.setSizes([left, total - left])
 
 
 # --------------------------------------------------------- PDF表示・ページ送りの共通基底
@@ -738,22 +775,6 @@ class BasePdfTab(QWidget):
 
     def set_sidebar_visible(self, visible: bool):
         self.sidebar.setVisible(visible)
-
-    def _set_initial_splitter_ratio(self, splitter: QSplitter, left_ratio: float):
-        """一覧側の初期幅をsplitter全体幅に対する比率で設定する。
-
-        構築直後はsplitterがまだ実際の幅を持っておらずsetSizes()に絶対的な小さい値
-        (例:[300, 700])を渡しても比率通りに解釈されない(Qtは値を比率としてではなく
-        現在の幅からの差分として扱うため)。そのため、最初のレイアウト後(イベント
-        ループの次のティック)に実際の幅から計算したピクセル値で設定し直す。
-        """
-        def apply():
-            total = splitter.width()
-            if total <= 0:
-                return
-            left = round(total * left_ratio)
-            splitter.setSizes([left, total - left])
-        QTimer.singleShot(0, apply)
 
     def _show_pdf_context_menu(self, pos):
         """PDF表示部分の右クリックメニュー。全画面表示中はしおり呼び出し・全画面解除の導線が
@@ -1016,7 +1037,7 @@ class PdfTab(BasePdfTab):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter = RatioSplitter(Qt.Orientation.Horizontal, 0.3)
         outer.addWidget(splitter)
 
         left = QWidget()
@@ -1080,7 +1101,6 @@ class PdfTab(BasePdfTab):
         splitter.addWidget(self.pdf_view)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 7)
-        self._set_initial_splitter_ratio(splitter, 0.3)
 
         self.list_view.selectionModel().currentChanged.connect(self._on_index_activated)
 
@@ -1340,7 +1360,7 @@ class DocumentPdfTab(BasePdfTab):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter = RatioSplitter(Qt.Orientation.Horizontal, 0.3)
         outer.addWidget(splitter)
 
         left = QWidget()
@@ -1387,7 +1407,6 @@ class DocumentPdfTab(BasePdfTab):
         splitter.addWidget(self.pdf_view)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 7)
-        self._set_initial_splitter_ratio(splitter, 0.3)
 
         self.list_view.selectionModel().currentChanged.connect(self._on_index_activated)
 
@@ -1543,6 +1562,10 @@ class WelcomeWidget(QWidget):
         self._thumb_cache: dict[str, QPixmap] = {}  # f"{path}:{mtime}" -> サムネイル画像
         self._build_ui()
 
+    @property
+    def title(self) -> str:
+        return "スタート"
+
     def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(40, 32, 40, 32)
@@ -1689,14 +1712,18 @@ class MainWindow(QMainWindow):
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tabs.currentChanged.connect(self._on_current_tab_changed)
 
-        # PDFを1つも開いていないとき、タブ領域が真っ白になるのを防ぐための開始画面。
-        self.welcome = WelcomeWidget(self)
+        # タブバー右端の「+」ボタン。押すと開始画面(お気に入り・最近使ったPDF・
+        # PDFを開くボタン)を新しいタブとして表示する。
+        new_tab_button = QToolButton()
+        new_tab_button.setText("+")
+        new_tab_button.setToolTip("開始画面を表示")
+        new_tab_button.clicked.connect(self.open_welcome_tab)
+        self.tabs.setCornerWidget(new_tab_button, Qt.Corner.TopRightCorner)
 
-        self.stack = QStackedWidget()
-        self.stack.addWidget(self.welcome)
-        self.stack.addWidget(self.tabs)
-        self.setCentralWidget(self.stack)
-        self.welcome.refresh()
+        self.setCentralWidget(self.tabs)
+
+        # 起動直後、PDFを1つも開いていないとき画面が真っ白にならないよう開始画面を開く。
+        self.open_welcome_tab()
 
     def _build_toolbar(self):
         toolbar = self.toolbar = QToolBar()
@@ -1857,30 +1884,50 @@ class MainWindow(QMainWindow):
             updated = current + [path]
         self.settings.setValue("favoriteFiles", updated)
         self._update_favorite_action()
-        if self.stack.currentWidget() is self.welcome:
-            self.welcome.refresh()
+        welcome_index = self._find_welcome_tab_index()
+        if welcome_index >= 0:
+            self.tabs.widget(welcome_index).refresh()
 
     def _on_favorite_action_triggered(self, _checked: bool):
         tab = self._current_tab()
-        if tab is not None:
+        if isinstance(tab, BasePdfTab):
             self.toggle_favorite(tab.pdf_path)
 
     def _update_favorite_action(self):
         tab = self._current_tab()
-        is_fav = tab is not None and self.is_favorite(tab.pdf_path)
+        is_fav = isinstance(tab, BasePdfTab) and self.is_favorite(tab.pdf_path)
         self.favorite_action.blockSignals(True)
         self.favorite_action.setChecked(is_fav)
         self.favorite_action.blockSignals(False)
-        self.favorite_action.setEnabled(tab is not None)
+        self.favorite_action.setEnabled(isinstance(tab, BasePdfTab))
 
     # --------------------------------------------------------------- タブ管理
     def _find_tab_index(self, path: str) -> int:
         path = os.path.abspath(path)
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
-            if os.path.abspath(tab.pdf_path) == path:
+            if isinstance(tab, BasePdfTab) and os.path.abspath(tab.pdf_path) == path:
                 return i
         return -1
+
+    def _find_welcome_tab_index(self) -> int:
+        for i in range(self.tabs.count()):
+            if isinstance(self.tabs.widget(i), WelcomeWidget):
+                return i
+        return -1
+
+    def open_welcome_tab(self):
+        """開始画面(お気に入り・最近使ったPDF)を新しいタブとして開く(既にあればそこへ切り替える)。"""
+        existing = self._find_welcome_tab_index()
+        if existing >= 0:
+            widget = self.tabs.widget(existing)
+            widget.refresh()
+            self.tabs.setCurrentIndex(existing)
+            return
+        welcome = WelcomeWidget(self)
+        welcome.refresh()
+        idx = self.tabs.addTab(welcome, welcome.title)
+        self.tabs.setCurrentIndex(idx)
 
     def open_pdf_dialog(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "PDFを開く", "", "PDF Files (*.pdf)")
@@ -1905,7 +1952,12 @@ class MainWindow(QMainWindow):
         idx = self.tabs.indexOf(tab)
         self.tabs.setTabToolTip(idx, path)
         self.tabs.setCurrentIndex(idx)
-        self.stack.setCurrentWidget(self.tabs)
+        # PDFを開いたら、役目を終えた開始画面タブは閉じてタブバーを整理する。
+        welcome_index = self._find_welcome_tab_index()
+        if welcome_index >= 0:
+            welcome_widget = self.tabs.widget(welcome_index)
+            self.tabs.removeTab(welcome_index)
+            welcome_widget.deleteLater()
         if ok:
             self._add_recent_file(path)
             unit = "件のメール" if isinstance(tab, PdfTab) else "件のしおり"
@@ -1933,15 +1985,16 @@ class MainWindow(QMainWindow):
     def _close_tab(self, index: int):
         tab = self.tabs.widget(index)
         self.tabs.removeTab(index)
-        if tab is not None:
+        if isinstance(tab, BasePdfTab):
             tab.document.close()
+        if tab is not None:
             tab.deleteLater()
+        # タブが1つも無くなると画面が真っ白になってしまうため、開始画面を開いておく。
         if self.tabs.count() == 0:
-            self.welcome.refresh()
-            self.stack.setCurrentWidget(self.welcome)
+            self.open_welcome_tab()
         self._update_controls_enabled()
 
-    def _current_tab(self) -> BasePdfTab | None:
+    def _current_tab(self) -> "BasePdfTab | WelcomeWidget | None":
         return self.tabs.currentWidget()
 
     def _unread_suffix(self, tab: BasePdfTab) -> str:
@@ -1957,7 +2010,8 @@ class MainWindow(QMainWindow):
             self._page_synced_tab = None
 
         tab = self._current_tab()
-        if tab is None:
+        if not isinstance(tab, BasePdfTab):
+            self._apply_fullscreen_chrome()
             self._update_controls_enabled()
             self._update_page_bar()
             self._update_favorite_action()
@@ -1986,14 +2040,14 @@ class MainWindow(QMainWindow):
         self._update_favorite_action()
 
     def _update_controls_enabled(self):
-        has_tab = self.tabs.count() > 0
+        has_tab = isinstance(self._current_tab(), BasePdfTab)
         self.search_box.setEnabled(has_tab)
         self.zoom_combo.setEnabled(has_tab)
         self.reindex_action.setEnabled(has_tab)
 
     def _update_page_bar(self):
         tab = self._current_tab()
-        if tab is None:
+        if not isinstance(tab, BasePdfTab):
             self.page_label.setText("- / -")
             self.prev_page_button.setEnabled(False)
             self.next_page_button.setEnabled(False)
@@ -2007,28 +2061,28 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------- 動作
     def reindex_current(self):
         tab = self._current_tab()
-        if tab is not None:
+        if isinstance(tab, BasePdfTab):
             self.load_pdf(tab.pdf_path, force_rebuild=True)
 
     def on_search_changed(self, text: str):
         tab = self._current_tab()
-        if tab is not None:
+        if isinstance(tab, BasePdfTab):
             tab.set_search(text)
             self.status.showMessage(f"{tab.result_count()} 件表示中{self._unread_suffix(tab)}")
 
     def on_zoom_mode_changed(self):
         tab = self._current_tab()
-        if tab is not None:
+        if isinstance(tab, BasePdfTab):
             tab.set_zoom_mode(self.zoom_combo.currentData())
 
     def go_prev_page(self):
         tab = self._current_tab()
-        if tab is not None:
+        if isinstance(tab, BasePdfTab):
             tab.go_prev_page()
 
     def go_next_page(self):
         tab = self._current_tab()
-        if tab is not None:
+        if isinstance(tab, BasePdfTab):
             tab.go_next_page()
 
     def _on_escape_pressed(self):
@@ -2060,7 +2114,7 @@ class MainWindow(QMainWindow):
         self.toolbar.setVisible(not full)
         self.status.setVisible(not full)
         tab = self._current_tab()
-        if tab is not None:
+        if isinstance(tab, BasePdfTab):
             tab.set_sidebar_visible(True if not full else self._sidebar_visible_in_fullscreen)
 
     def changeEvent(self, event):
