@@ -118,6 +118,7 @@ def _build(pdf_path: str, db_path: str) -> None:
             conn.execute("INSERT INTO meta(key, value) VALUES ('pdf_signature', ?)",
                          (_pdf_signature(pdf_path),))
             conn.execute("INSERT INTO meta(key, value) VALUES ('mode', 'mail')")
+            conn.execute("INSERT INTO meta(key, value) VALUES ('mail_index_version', ?)", (MAIL_INDEX_VERSION,))
             conn.executemany(
                 """INSERT INTO mails
                    (id, raw_title, subject, sender, sender_short, to_addr, cc, attachments, attachments_json,
@@ -127,7 +128,8 @@ def _build(pdf_path: str, db_path: str) -> None:
                     (
                         m.index, m.raw_title, m.subject, m.sender, m.sender_short, m.to, m.cc,
                         " / ".join(a.name for a in m.attachments),
-                        json.dumps([{"name": a.name, "start_page": a.start_page, "end_page": a.end_page}
+                        json.dumps([{"name": a.name, "start_page": a.start_page, "end_page": a.end_page,
+                                     "fallback_page": a.fallback_page}
                                     for a in m.attachments]),
                         m.received_at, m.sent_at,
                         m.sent_date_from_title.isoformat() if m.sent_date_from_title else "",
@@ -168,6 +170,11 @@ def _build_document(pdf_path: str, db_path: str) -> None:
         conn.close()
 
 
+# メール束PDFのインデックス内容を変えたら上げる(古いインデックスは開いたときに自動で作り直す。既読状態は引き継ぐ)
+# 2: 添付ファイルをしおりと名前で照合し、位置不明の添付に「添付の先頭ページ」を記録
+MAIL_INDEX_VERSION = "2"
+
+
 def open_or_build(pdf_path: str, mode: str = "mail", force_rebuild: bool = False) -> str:
     """インデックスDBのパスを返す。必要なら(再)構築する。
 
@@ -186,7 +193,8 @@ def open_or_build(pdf_path: str, mode: str = "mail", force_rebuild: bool = False
         conn = sqlite3.connect(db_path)
         try:
             meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
-            if meta.get("pdf_signature") != sig or meta.get("mode", "mail") != mode:
+            outdated = mode == "mail" and meta.get("mail_index_version") != MAIL_INDEX_VERSION
+            if meta.get("pdf_signature") != sig or meta.get("mode", "mail") != mode or outdated:
                 conn.close()
                 builder(pdf_path, db_path)
                 return db_path
@@ -213,6 +221,12 @@ class AttachmentInfo:
     name: str
     start_page: int | None
     end_page: int | None = None
+    fallback_page: int | None = None  # 位置不明の添付の移動先(添付の先頭ページ)
+
+    @property
+    def jump_page(self) -> int | None:
+        """クリックしたときの移動先。位置が分かればその添付、分からなければ添付の先頭ページ。"""
+        return self.start_page if self.start_page is not None else self.fallback_page
 
 
 @dataclass
@@ -236,7 +250,8 @@ class MailRow:
     def attachment_list(self) -> list[AttachmentInfo]:
         if not self.attachments_json:
             return []
-        return [AttachmentInfo(name=a["name"], start_page=a["start_page"], end_page=a.get("end_page"))
+        return [AttachmentInfo(name=a["name"], start_page=a["start_page"], end_page=a.get("end_page"),
+                               fallback_page=a.get("fallback_page"))
                 for a in json.loads(self.attachments_json)]
 
 
