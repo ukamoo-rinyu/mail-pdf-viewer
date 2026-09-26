@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -55,6 +56,7 @@ class AttachmentRef:
     name: str
     start_page: int | None  # ジャンプ先/印刷範囲が特定できない場合はNone
     end_page: int | None = None
+    fallback_page: int | None = None  # 位置が特定できないときの移動先(添付の先頭ページ)
 
 
 @dataclass
@@ -162,6 +164,30 @@ def _find_child(node: TocNode, keyword: str) -> TocNode | None:
     return None
 
 
+def _name_key(name: str) -> str:
+    """添付ファイル名の照合用キー(拡張子・空白・全角半角・大文字小文字の違いを無視)。"""
+    stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", unicodedata.normalize("NFKC", name or "").strip())
+    return re.sub(r"\s+", "", stem).lower()
+
+
+def _match_attachments(names: list[str], leaves: list["TocNode"], fallback: int | None) -> list[AttachmentRef]:
+    """ヘッダー欄の添付ファイル名と、しおりの添付(ページ番号を持つ)を名前で照合する。
+    しおり名は長い名前が省略されていることがあるため、前方一致も一致とみなす。"""
+    remaining = list(leaves)
+    result = []
+    for name in names:
+        key = _name_key(name)
+        leaf = next((lf for lf in remaining if key and _name_key(lf.name)
+                     and (key == _name_key(lf.name) or key.startswith(_name_key(lf.name))
+                          or _name_key(lf.name).startswith(key))), None)
+        if leaf is not None:
+            remaining.remove(leaf)
+            result.append(AttachmentRef(name=name, start_page=leaf.start_page, end_page=leaf.end_page))
+        else:
+            result.append(AttachmentRef(name=name, start_page=None, end_page=None, fallback_page=fallback))
+    return result
+
+
 def _collect_leaf_names(node: TocNode) -> list[str]:
     if not node.children:
         return [node.name]
@@ -249,11 +275,19 @@ def extract_mails(pdf_path: str) -> list[Mail]:
             names = []
 
         if leaves and len(leaves) == len(names):
-            # しおり(ページ番号を持つ)とヘッダー欄(拡張子を持つ)の順序・件数が一致する場合のみ紐付ける
+            # しおり(ページ番号を持つ)とヘッダー欄(拡張子を持つ)の順序・件数が一致する場合は順番で紐付ける
             attachments = [AttachmentRef(name=n, start_page=leaf.start_page, end_page=leaf.end_page)
                            for n, leaf in zip(names, leaves)]
         else:
-            attachments = [AttachmentRef(name=n, start_page=None, end_page=None) for n in names]
+            # 件数が合わない(PDF化されなかった添付がある等)ときは名前で照合し、
+            # 見つからない添付は「添付の先頭ページ」へ移動できるようにしておく
+            if attach_node is not None:
+                fallback = attach_node.start_page
+            elif body_end < node.end_page:
+                fallback = body_end + 1
+            else:
+                fallback = None
+            attachments = _match_attachments(names, leaves, fallback)
 
         subject = header["件名"] or subject_from_title
 
