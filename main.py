@@ -79,6 +79,10 @@ import db
 import outlook_reply
 import parser
 
+# 図面モード(drawing_tab.py)が「import main」でこのファイルの部品を使うため、
+# python main.py で起動したとき(モジュール名が __main__ になる)も同じものを参照させる。
+sys.modules.setdefault("main", sys.modules[__name__])
+
 APP_NAME = "kojiPDFviewer"
 
 MAIL_ROLE = Qt.UserRole + 1
@@ -3331,6 +3335,17 @@ class WelcomeWidget(QWidget):
         open_button.setCursor(Qt.CursorShape.PointingHandCursor)
         open_button.clicked.connect(self._window.open_pdf_dialog)
         button_row.addWidget(open_button)
+        # 図面モード(図面セットの発注前チェック・工事台帳)の入口
+        drawing_button = QPushButton("図面セットとして開く")
+        drawing_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        drawing_button.setToolTip("図面PDFの目次と各図面の表題欄を照合し、要確認の項目を一覧にする")
+        drawing_button.clicked.connect(lambda: self._window.open_drawing_set())
+        button_row.addWidget(drawing_button)
+        ledger_button = QPushButton("工事フォルダを開く")
+        ledger_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        ledger_button.setToolTip("工事台帳(図面ごとの変更記録)を開く・新しく作る")
+        ledger_button.clicked.connect(lambda: self._window.open_ledger_folder())
+        button_row.addWidget(ledger_button)
         button_row.addStretch(1)
         drop_layout.addLayout(button_row)
         outer.addWidget(drop, 0, Qt.AlignmentFlag.AlignHCenter)
@@ -3611,6 +3626,9 @@ class MainWindow(NoToolbarMenuMainWindow):
             menu.addAction("再インデックス（一覧を作り直す）", lambda: self.load_pdf(tab.pdf_path, force_rebuild=True))
             menu.addSeparator()
         menu.addAction("PDFを開く...  (Ctrl+O)", self.open_pdf_dialog)
+        menu.addAction("図面セットとして開く...",
+                       lambda: self.open_drawing_set(tab.pdf_path if isinstance(tab, BasePdfTab) else None))
+        menu.addAction("工事フォルダ(工事台帳)を開く...", self.open_ledger_folder)
         recent = self._recent_files()
         if recent:
             recent_menu = menu.addMenu("最近使ったPDF")
@@ -3703,9 +3721,20 @@ class MainWindow(NoToolbarMenuMainWindow):
             welcome_widget.deleteLater()
         if ok:
             self._add_recent_file(path)
-            unit = "件のメール" if isinstance(tab, PdfTab) else "件のしおり"
+            unit = getattr(tab, "RESULT_UNIT", "件のメール" if isinstance(tab, PdfTab) else "件のしおり")
             self.status.showMessage(
                 f"{tab.result_count()} {unit}を読み込みました{self._unread_suffix(tab)}", 5000)
+
+    # --------------------------------------------------------------- 図面モード(drawing_tab.py)
+    def open_drawing_set(self, path: str | None = None):
+        """図面セットとして開く(発注前チェックの結果一覧つき)。pathがなければファイルを選ぶ。"""
+        import drawing_tab
+        drawing_tab.open_drawing_set(self, path)
+
+    def open_ledger_folder(self, folder: str | None = None):
+        """工事フォルダの工事台帳を開く(なければ新しく作る)。"""
+        import drawing_tab
+        drawing_tab.open_ledger_folder(self, folder)
 
     # --------------------------------------------------------------- 別ウインドウ表示
     def open_page_range_window(self, title: str, pdf_path: str, start_page: int, end_page: int,
