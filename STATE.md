@@ -1,6 +1,6 @@
 # STATE — 工事図面管理機能の作業引き継ぎメモ
 
-最終更新: 2026-09-29
+最終更新: 2026-09-30
 
 ## 現在のフェーズ
 
@@ -9,6 +9,9 @@
 業務ルールで仕様書が「利用者に確認する」としている点は、下の「仮決め」として実装し、確認待ちにしている）
 
 仕様・計画・作業記録は `specs/013-drawing-management/`（spec.md / plan.md / tasks.md）。
+
+作業ブランチは `feature/drawing-management`（`feature/browser-ui-for-koji` の v0.4.0 から分岐）。
+2026-09-29 にコミット `5f3818d` として push 済み。プルリクエストはまだ作っていない。
 
 ## 完了したこと
 
@@ -60,17 +63,18 @@
 - 読み取りを「行」単位から「欄の中から始まる文字」単位に補強した。PyMuPDF は近い文字を1行にまとめることがあり、
   総枚数が記入された図面で「（２」のように隣の文字と1行になると、試作の方法では読み落とす可能性があったため。実図面では試作と同じ結果
 - 図面名称の表示は正規化後（全角英数→半角、「～」→「~」）の文字になる
-- `tests/data/` と `tools/` は公開リポジトリに入る可能性がある。PDFは `.gitignore` で除外済み。コミット・push はまだしていない
+- `tools/`（`check_drawings_prototype.py`・`make_error_sample.py`）は公開リポジトリにコミット済み。
+  `tests/data/` のPDFは `.gitignore` の `*.pdf` で除外されており、リポジトリには入っていない（2026-09-30 確認）
 
 ## 次にやること
 
 1. 利用者に動作確認をしてもらう（手順は下記）
 2. 仮決めした業務ルール（上の1〜3）の確認と、必要なら修正
-3. 確認が取れたらコミット（ブランチ `feature/browser-ui-for-koji` の worktree `app-koji`）
+3. 確認が取れたら、`feature/drawing-management` から `feature/browser-ui-for-koji` へのプルリクエストを作る
 
 ## 動作確認の手順（利用者向け）
 
-1. `app-koji` フォルダで `python main.py` を実行
+1. `feature/drawing-management` を取り出したフォルダ（手元の worktree `app-koji` など）で `python main.py` を実行
 2. 開始画面の「図面セットとして開く」→ `tests/data/実図面_間違い仕込み.pdf` → 様式を選んでOK
    - 左の一覧で p3・p9・p10 に「要確認」、p8 に参照先の指摘が出ること
    - 指摘をクリックすると、右の図面の該当箇所が拡大されて赤枠が付くこと
